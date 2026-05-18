@@ -20,6 +20,7 @@
 #include "circt/Dialect/Arc/ArcInterfaces.h"
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
+#include "circt/Dialect/Arc/EmitCausalityPass.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
 #include "circt/Dialect/Comb/CombDialect.h"
@@ -131,6 +132,18 @@ static llvm::cl::opt<std::string> stateFile("state-file",
                                             llvm::cl::value_desc("filename"),
                                             llvm::cl::init(""),
                                             llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<std::string>
+    causalityDir("causality-dir",
+                 llvm::cl::desc("Output directory for causality artifacts "
+                                "(__signal_index.json emitted here)"),
+                 llvm::cl::init(""), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<std::string>
+    causalitySinks("causality-sinks",
+                   llvm::cl::desc("Comma-separated list of observable signal "
+                                  "names to instrument for causality tracing"),
+                   llvm::cl::init(""), llvm::cl::cat(mainCategory));
 
 static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
                                         llvm::cl::init(true),
@@ -382,6 +395,12 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   ArcStateLoweringOptions loweringOpt;
   loweringOpt.shouldInline = shouldInline;
   populateArcStateLoweringPipeline(pm, loweringOpt);
+
+  // Inject causality instrumentation immediately after state lowering so that
+  // arc.state_write and comb.mux are still in the same flat scope.
+  if (!causalityDir.empty())
+    pm.addPass(arc::createEmitCausalityPass(
+        {std::string(causalityDir), std::string(causalitySinks)}));
 
   // Allocate states.
   if (untilReached(UntilStateAlloc))
