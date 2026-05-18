@@ -1,5 +1,6 @@
 add_circt_dialect_library(CIRCTArcTransforms
   EmitCausality.cpp
+  InjectFault.cpp
   AddTaps.cpp
   AllocateState.cpp
   ArcCanonicalizer.cpp

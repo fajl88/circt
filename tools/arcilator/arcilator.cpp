@@ -21,6 +21,7 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Arc/EmitCausalityPass.h"
+#include "circt/Dialect/Arc/InjectFaultPass.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
 #include "circt/Dialect/Comb/CombDialect.h"
@@ -144,6 +145,18 @@ static llvm::cl::opt<std::string>
                    llvm::cl::desc("Comma-separated list of observable signal "
                                   "names to instrument for causality tracing"),
                    llvm::cl::init(""), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<int>
+    faultWriteSiteId("fault-write-site-id",
+                     llvm::cl::desc("Signal ID (write_site_id) at which to "
+                                    "inject a bit-flip fault (0 = disabled)"),
+                     llvm::cl::init(0), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<int>
+    faultBit("fault-bit",
+             llvm::cl::desc("Bit position to flip when --fault-write-site-id "
+                            "is set (0-indexed from LSB)"),
+             llvm::cl::init(0), llvm::cl::cat(mainCategory));
 
 static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
                                         llvm::cl::init(true),
@@ -401,6 +414,12 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   if (!causalityDir.empty())
     pm.addPass(arc::createEmitCausalityPass(
         {std::string(causalityDir), std::string(causalitySinks)}));
+
+  // Inject fault immediately after causality instrumentation so that
+  // EmitCausality records the original (pre-fault) data flow, while
+  // the state write receives the flipped value.
+  if (faultWriteSiteId > 0)
+    pm.addPass(arc::createInjectFaultPass({faultWriteSiteId, faultBit}));
 
   // Allocate states.
   if (untilReached(UntilStateAlloc))

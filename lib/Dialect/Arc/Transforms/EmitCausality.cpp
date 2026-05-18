@@ -135,10 +135,14 @@ private:
   // State handle Value → 1-indexed signal ID
   DenseMap<Value, int64_t> storageToId;
 
+  // arc.state_write Operation* → 1-indexed write-site ID
+  DenseMap<Operation *, int64_t> writeOpToSiteId;
+
   // External function declarations added to the module
   func::FuncOp beginDecl, addPredDecl, commitDecl;
 
   void enumSignals();
+  void enumWriteSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
@@ -185,6 +189,7 @@ void EmitCausalityPass::runOnOperation() {
     return;
 
   enumSignals();
+  enumWriteSites();
   writeSignalIndex();
   declareRuntimeFuncs();
 
@@ -235,6 +240,17 @@ void EmitCausalityPass::enumSignals() {
 }
 
 // =======================================================================
+// Phase 1b: enumerate arc.state_write ops and assign write-site IDs
+// =======================================================================
+
+void EmitCausalityPass::enumWriteSites() {
+  int64_t counter = 1;
+  module.walk([&](StateWriteOp op) {
+    writeOpToSiteId[op.getOperation()] = counter++;
+  });
+}
+
+// =======================================================================
 // Phase 2: write __signal_index.json
 // =======================================================================
 
@@ -269,6 +285,24 @@ void EmitCausalityPass::writeSignalIndex() {
   llvm::json::Object root;
   root["format"] = "trace_causality_signal_index";
   root["signals"] = llvm::json::Value(std::move(signals));
+
+  // Write-site table: one entry per arc.state_write op, using the same
+  // deterministic walk order as enumWriteSites().  write_site_id is unique
+  // per write op; signal_id/signal_name identify the target register.
+  llvm::json::Array writeSites;
+  module.walk([&](StateWriteOp op) {
+    int64_t wsid = writeOpToSiteId.lookup(op.getOperation());
+    int64_t sigId = lookupId(op.getState());
+    StringRef name = getStateName(op.getState());
+    llvm::json::Object e;
+    e["write_site_id"] = wsid;
+    if (sigId != -1)
+      e["signal_id"] = sigId;
+    if (!name.empty())
+      e["signal_name"] = name.str();
+    writeSites.push_back(llvm::json::Value(std::move(e)));
+  });
+  root["write_sites"] = llvm::json::Value(std::move(writeSites));
 
   std::string outPath = opts.causalityDir + "/__signal_index.json";
   std::error_code ec;
@@ -322,6 +356,9 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
   if (auto itype = dyn_cast<IntegerType>(writtenVal.getType()))
     numBits = static_cast<int32_t>(itype.getWidth());
 
+  // Resolve the write-site ID for this specific arc.state_write op.
+  int64_t wsid = writeOpToSiteId.lookup(writeOp.getOperation());
+
   // Case A: direct comb.mux → path-sensitive scf.if
   if (auto muxOp = writtenVal.getDefiningOp<comb::MuxOp>()) {
     Value cond = muxOp.getCond();
@@ -344,7 +381,7 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
     {
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
-      emitBegin(builder, loc, sinkId, sinkId, trueVal, numBits);
+      emitBegin(builder, loc, sinkId, wsid, trueVal, numBits);
       if (trueId != -1) emitAddPred(builder, loc, trueId, ROLE_DATA, 0);
       if (condId != -1) emitAddPred(builder, loc, condId, ROLE_CONTROL_GUARD, 0);
       emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
@@ -353,7 +390,7 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
     {
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(ifOp.elseBlock()->getTerminator());
-      emitBegin(builder, loc, sinkId, sinkId, falseVal, numBits);
+      emitBegin(builder, loc, sinkId, wsid, falseVal, numBits);
       if (falseId != -1) emitAddPred(builder, loc, falseId, ROLE_DATA, 0);
       if (condId != -1) emitAddPred(builder, loc, condId, ROLE_CONTROL_GUARD, 0);
       emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
@@ -365,7 +402,7 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
   // Case B: direct arc.state_read
   if (auto srcState = resolveDirectState(writtenVal)) {
     int64_t srcId = lookupId(srcState);
-    emitBegin(builder, loc, sinkId, sinkId, writtenVal, numBits);
+    emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
     if (srcId != -1) emitAddPred(builder, loc, srcId, ROLE_DATA, 0);
     emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
     emitCommit(builder, loc);
@@ -377,7 +414,7 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
   DenseSet<Value> visited;
   collectStateHandles(writtenVal, handles, visited);
 
-  emitBegin(builder, loc, sinkId, sinkId, writtenVal, numBits);
+  emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
   for (auto handle : handles) {
     int64_t predId = lookupId(handle);
     if (predId != -1)
