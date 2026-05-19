@@ -254,7 +254,9 @@ bool InlineArcsAnalysis::shouldInline(mlir::CallOpInterface callOp) const {
   if (numOpsInArc.at(arcName) <= options.maxNonTrivialOpsInBody)
     return true;
 
-  return usersPerArc.at(arcName) == 1;
+  // Inline unconditionally so that EmitCausality sees a fully flat graph with
+  // no arc.call nodes, preventing false-positive predecessor overapproximation.
+  return true;
 }
 
 DefineOp InlineArcsAnalysis::getArc(mlir::CallOpInterface callOp) const {

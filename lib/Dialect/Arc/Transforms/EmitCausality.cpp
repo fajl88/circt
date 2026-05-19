@@ -12,10 +12,18 @@
 // The pass does two things:
 //   1. (Compile-time) Enumerate all state handles, assign sequential IDs,
 //      write __signal_index.json to causalityDir/.
-//   2. (Instrumentation) For each arc.state_write whose handle name is in
-//      sinkNames, insert causality_begin / causality_add_pred / causality_commit
-//      calls before the write.  Path-sensitivity is achieved by splitting on
-//      any direct comb.mux feeding the written value.
+//   2. (Instrumentation) For every arc.state_write, emit one causality_begin /
+//      causality_commit pair around a recursive walk of the written value's
+//      combinational expression.  The walk emits causality_add_pred calls at
+//      arc.state_read leaves (DATA role) and inserts scf.if guards at every
+//      comb.mux so that only the runtime-active branch's state reads become
+//      predecessors of the event.  Mux conditions that are direct state reads
+//      also get a CONTROL_GUARD predecessor.
+//
+// Every state write is instrumented unconditionally so that backward slicing
+// can follow predecessor chains transitively through the full circuit.  The
+// --causality-sinks command-line option is currently ignored (it used to
+// restrict instrumentation to a hand-picked subset of observable signals).
 //
 // Registration: this pass is registered manually in arcilator.cpp (not via
 // ArcPasses.td) so that touching ArcPasses.td and triggering a full rebuild
@@ -44,6 +52,27 @@ using namespace circt;
 using namespace arc;
 using namespace mlir;
 
+// ---------------------------------------------------------------------------
+// Debug logging: set CAUSALITY_DEBUG=1 in the environment before running
+// arcilator to get a per-write-site trace of every operation visited, every
+// guard emitted, and every add_pred call generated.
+// ---------------------------------------------------------------------------
+static bool causalityDebug() {
+  static int cached = -1;
+  if (cached == -1)
+    cached = (::getenv("CAUSALITY_DEBUG") != nullptr) ? 1 : 0;
+  return cached == 1;
+}
+
+// Indent level for nested walkValue calls.
+static thread_local int gWalkDepth = 0;
+
+static void dbg(const llvm::Twine &msg) {
+  if (!causalityDebug()) return;
+  for (int i = 0; i < gWalkDepth; ++i) llvm::errs() << "  ";
+  llvm::errs() << "[causality] " << msg << "\n";
+}
+
 namespace {
 
 // Predecessor roles (must match causality_runtime.cc)
@@ -68,27 +97,6 @@ static StringRef getStateName(Value state) {
   if (auto rootOut = dyn_cast<RootOutputOp>(defOp))
     return rootOut.getName();
   return {};
-}
-
-// -----------------------------------------------------------------------
-// DFS: collect all arc.state_read storage handles reachable from val
-// without crossing a state-write boundary.
-// -----------------------------------------------------------------------
-static void collectStateHandles(Value val, SmallVectorImpl<Value> &handles,
-                                 DenseSet<Value> &visited) {
-  if (!visited.insert(val).second)
-    return;
-  Operation *defOp = val.getDefiningOp();
-  if (!defOp)
-    return;
-  if (auto readOp = dyn_cast<StateReadOp>(defOp)) {
-    handles.push_back(readOp.getState());
-    return;
-  }
-  if (isa<StateWriteOp>(defOp))
-    return;
-  for (Value operand : defOp->getOperands())
-    collectStateHandles(operand, handles, visited);
 }
 
 // -----------------------------------------------------------------------
@@ -146,6 +154,7 @@ private:
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
+  void walkValue(OpBuilder &b, Value val, DenseSet<Value> &visited);
 
   void emitBegin(OpBuilder &b, Location loc, int64_t sinkId, int64_t wsid,
                  Value newVal, int32_t numBits);
@@ -193,25 +202,13 @@ void EmitCausalityPass::runOnOperation() {
   writeSignalIndex();
   declareRuntimeFuncs();
 
-  llvm::StringSet<> sinkSet;
-  {
-    StringRef sr(opts.sinkNames);
-    while (!sr.empty()) {
-      auto [head, tail] = sr.split(',');
-      head = head.trim();
-      if (!head.empty())
-        sinkSet.insert(head);
-      sr = tail;
-    }
-  }
-
+  // Instrument ALL write sites, not just named sinks.
+  // Every write site must emit a causality event so that backward slicing
+  // can follow predecessors transitively through the full circuit.
   SmallVector<StateWriteOp> writes;
   module.walk([&](StateWriteOp op) { writes.push_back(op); });
 
   for (auto writeOp : writes) {
-    StringRef name = getStateName(writeOp.getState());
-    if (name.empty() || !sinkSet.count(name))
-      continue;
     int64_t sinkId = lookupId(writeOp.getState());
     if (sinkId == -1)
       continue;
@@ -356,72 +353,202 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
   if (auto itype = dyn_cast<IntegerType>(writtenVal.getType()))
     numBits = static_cast<int32_t>(itype.getWidth());
 
-  // Resolve the write-site ID for this specific arc.state_write op.
   int64_t wsid = writeOpToSiteId.lookup(writeOp.getOperation());
+  StringRef sinkName = getStateName(writeOp.getState());
 
-  // Case A: direct comb.mux → path-sensitive scf.if
-  if (auto muxOp = writtenVal.getDefiningOp<comb::MuxOp>()) {
+  dbg("=== WriteOp sink_id=" + llvm::Twine(sinkId) +
+      " (" + (sinkName.empty() ? "?" : sinkName) + ")" +
+      " ws_id=" + llvm::Twine(wsid) +
+      " bits=" + llvm::Twine(numBits));
+
+  emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
+  DenseSet<Value> visited;
+  gWalkDepth = 1;
+  walkValue(builder, writtenVal, visited);
+  gWalkDepth = 0;
+  emitCommit(builder, loc);
+}
+
+// -----------------------------------------------------------------------
+// walkValue: recursively descend through a combinational expression, emitting
+//   - DATA add_pred at every arc.state_read leaf,
+//   - scf.if-guarded sub-walks at every comb.mux (only the executed branch's
+//     state reads become predecessors of the current event),
+//   - CONTROL_GUARD add_pred when a mux condition is a direct state read.
+//
+// The `visited` set prevents redundant descent into CSE-shared subexpressions
+// within a single straight-line walk. It is passed by reference so insertions
+// accumulate across sibling operands of the same parent op. At each scf.if
+// boundary we COPY the current visited set into the then/else branches: this
+// (a) inherits dedup state from the parent context (a state read already
+// emitted unconditionally before the scf.if must not be re-emitted inside the
+// branch, since the parent's add_pred always fires), and (b) keeps the two
+// branches independent of each other (a state read referenced in both
+// branches must be emitted in each, because only one branch's IR runs at
+// runtime).
+//
+// OVERAPPROXIMATION (known, minor):
+//   - comb.extract: a fault in bits outside the extracted range cannot
+//     propagate. Fixing requires per-bit range tracking across the walk —
+//     non-trivial and rare in practice.
+//   - comb.mux conditions that are complex sub-expressions (not direct
+//     arc.state_reads) are walked as DATA, missing CONTROL_GUARD tagging for
+//     the state reads inside the condition. Cosmetic: affects slicer edge
+//     coloring only, not injection site selection.
+// -----------------------------------------------------------------------
+void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
+                                   DenseSet<Value> &visited) {
+  if (!visited.insert(val).second) {
+    dbg("(already visited, skip)");
+    return;
+  }
+
+  Operation *defOp = val.getDefiningOp();
+  if (!defOp) {
+    dbg("block-arg / constant (no defOp), skip");
+    return;
+  }
+
+  // Stop at state-write boundaries: a written register is a separate event,
+  // not a predecessor reached through combinational logic.
+  if (isa<StateWriteOp>(defOp)) {
+    dbg("stop at StateWriteOp boundary");
+    return;
+  }
+
+  // Leaf: arc.state_read becomes a DATA predecessor.
+  if (auto readOp = dyn_cast<StateReadOp>(defOp)) {
+    int64_t predId = lookupId(readOp.getState());
+    StringRef name = getStateName(readOp.getState());
+    dbg("state_read id=" + llvm::Twine(predId) +
+        " (" + (name.empty() ? "?" : name) + ")" +
+        " -> add_pred(DATA)");
+    if (predId != -1)
+      emitAddPred(builder, readOp.getLoc(), predId, ROLE_DATA, -1);
+    return;
+  }
+
+  // Path-sensitive split: comb.mux executes only one of its data operands.
+  if (auto muxOp = dyn_cast<comb::MuxOp>(defOp)) {
     Value cond = muxOp.getCond();
-    Value trueVal = muxOp.getTrueValue();
-    Value falseVal = muxOp.getFalseValue();
+    Location muxLoc = muxOp.getLoc();
 
-    int64_t trueId = -1, falseId = -1, condId = -1;
-    if (auto s = resolveDirectState(trueVal))
-      trueId = lookupId(s);
-    if (auto s = resolveDirectState(falseVal))
-      falseId = lookupId(s);
-    if (auto s = resolveDirectState(cond))
-      condId = lookupId(s);
+    dbg("comb.mux  -> walk cond unconditionally");
+    ++gWalkDepth;
+    walkValue(builder, cond, visited);
+    --gWalkDepth;
 
-    // Insert scf.if before the state_write (both blocks get yield terminators
-    // automatically when withElseRegion=true and no result types).
+    if (auto s = resolveDirectState(cond)) {
+      int64_t cid = lookupId(s);
+      StringRef name = getStateName(s);
+      dbg("comb.mux  cond is direct state_read id=" + llvm::Twine(cid) +
+          " (" + (name.empty() ? "?" : name) + ") -> add_pred(CONTROL_GUARD)");
+      if (cid != -1)
+        emitAddPred(builder, muxLoc, cid, ROLE_CONTROL_GUARD, -1);
+    }
+
+    dbg("comb.mux  emit scf.if; then-branch walks trueVal, else-branch walks falseVal");
     auto ifOp =
-        builder.create<scf::IfOp>(loc, cond, /*withElseRegion=*/true);
-
+        builder.create<scf::IfOp>(muxLoc, cond, /*withElseRegion=*/true);
     {
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
-      emitBegin(builder, loc, sinkId, wsid, trueVal, numBits);
-      if (trueId != -1) emitAddPred(builder, loc, trueId, ROLE_DATA, 0);
-      if (condId != -1) emitAddPred(builder, loc, condId, ROLE_CONTROL_GUARD, 0);
-      emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
-      emitCommit(builder, loc);
+      DenseSet<Value> thenVisited = visited;
+      ++gWalkDepth;
+      dbg("comb.mux  [then]:");
+      walkValue(builder, muxOp.getTrueValue(), thenVisited);
+      --gWalkDepth;
     }
     {
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPoint(ifOp.elseBlock()->getTerminator());
-      emitBegin(builder, loc, sinkId, wsid, falseVal, numBits);
-      if (falseId != -1) emitAddPred(builder, loc, falseId, ROLE_DATA, 0);
-      if (condId != -1) emitAddPred(builder, loc, condId, ROLE_CONTROL_GUARD, 0);
-      emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
-      emitCommit(builder, loc);
+      DenseSet<Value> elseVisited = visited;
+      ++gWalkDepth;
+      dbg("comb.mux  [else]:");
+      walkValue(builder, muxOp.getFalseValue(), elseVisited);
+      --gWalkDepth;
     }
     return;
   }
 
-  // Case B: direct arc.state_read
-  if (auto srcState = resolveDirectState(writtenVal)) {
-    int64_t srcId = lookupId(srcState);
-    emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
-    if (srcId != -1) emitAddPred(builder, loc, srcId, ROLE_DATA, 0);
-    emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
-    emitCommit(builder, loc);
+  // Path-sensitive: comb.and / comb.or short-circuit masking.
+  //
+  // A single-bit fault in operand i propagates through a gate only when the
+  // other operands do not already force the output to a fixed value:
+  //   AND: operand i matters only when AND(all others) != 0
+  //         (if any other operand is 0, the output is stuck at 0 regardless)
+  //   OR:  operand i matters only when OR(all others) == 0
+  //         (if any other operand is 1, the output is stuck at 1 regardless)
+  //
+  // For each operand we compute the AND/OR of the remaining ones at compile
+  // time (as an arith expression over the already-live SSA values), then emit
+  // a runtime scf.if guard before recursing into that operand's sub-tree.
+  //
+  // Corner cases:
+  //   - N=1: single operand always propagates; walk unconditionally.
+  //   - AND, two operands both 0 (or OR, two operands both 1): guards for
+  //     both operands evaluate to false at runtime, so zero add_pred calls
+  //     are emitted. This is correct: no single-bit flip can change the
+  //     output in that configuration.
+  if (isa<comb::AndOp, comb::OrOp>(defOp)) {
+    const bool isAnd = isa<comb::AndOp>(defOp);
+    OperandRange operands = defOp->getOperands();
+    Location loc = defOp->getLoc();
+
+    dbg(llvm::Twine(isAnd ? "comb.and" : "comb.or") +
+        "  " + llvm::Twine(operands.size()) + " operands, emitting guards");
+
+    for (unsigned i = 0; i < operands.size(); ++i) {
+      Value guardExpr;
+      for (unsigned j = 0; j < operands.size(); ++j) {
+        if (j == i)
+          continue;
+        if (!guardExpr) {
+          guardExpr = operands[j];
+        } else if (isAnd) {
+          guardExpr = builder.create<arith::AndIOp>(loc, guardExpr, operands[j]);
+        } else {
+          guardExpr = builder.create<arith::OrIOp>(loc, guardExpr, operands[j]);
+        }
+      }
+
+      if (!guardExpr) {
+        dbg("  operand[" + llvm::Twine(i) + "] single-operand gate, walk unconditionally");
+        ++gWalkDepth;
+        walkValue(builder, operands[i], visited);
+        --gWalkDepth;
+        continue;
+      }
+
+      Value zero = builder.create<arith::ConstantOp>(
+          loc, builder.getIntegerAttr(guardExpr.getType(), 0));
+      arith::CmpIPredicate cmpPred =
+          isAnd ? arith::CmpIPredicate::ne : arith::CmpIPredicate::eq;
+      Value cond = builder.create<arith::CmpIOp>(loc, cmpPred, guardExpr, zero);
+
+      dbg("  operand[" + llvm::Twine(i) + "] guard: " +
+          (isAnd ? "AND(others)!=0" : "OR(others)==0") +
+          " -> scf.if");
+      auto ifOp = builder.create<scf::IfOp>(loc, cond, /*withElseRegion=*/false);
+      {
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+        DenseSet<Value> branchVisited = visited;
+        ++gWalkDepth;
+        walkValue(builder, operands[i], branchVisited);
+        --gWalkDepth;
+      }
+    }
     return;
   }
 
-  // Case C: general combinational expression — DFS to collect all state reads
-  SmallVector<Value> handles;
-  DenseSet<Value> visited;
-  collectStateHandles(writtenVal, handles, visited);
-
-  emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
-  for (auto handle : handles) {
-    int64_t predId = lookupId(handle);
-    if (predId != -1)
-      emitAddPred(builder, loc, predId, ROLE_DATA, 0);
-  }
-  emitAddPred(builder, loc, sinkId, ROLE_PRIOR_STATE, -1);
-  emitCommit(builder, loc);
+  // Generic combinational op: log the op name and recurse into all operands.
+  dbg(defOp->getName().getStringRef() +
+      "  " + llvm::Twine(defOp->getNumOperands()) + " operands -> recurse all");
+  ++gWalkDepth;
+  for (Value operand : defOp->getOperands())
+    walkValue(builder, operand, visited);
+  --gWalkDepth;
 }
 
 // =======================================================================
