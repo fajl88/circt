@@ -15,12 +15,15 @@ namespace circt {
 namespace arc {
 
 struct InjectFaultPassOptions {
-  int faultWriteSiteId = 0; // signal ID to inject into (0 = disabled)
-  int faultBit = 0;         // bit position to flip
+  int faultWriteSiteId = 0; // write site ID for bit-flip injection (0 = disabled)
+  int faultBit = 0;         // bit position to flip (bit-flip only)
+  int faultCombSiteId = 0;  // comb site ID for guard-removal injection (0 = disabled)
+  int faultCombOperand = 0; // operand index to replace with identity (guard-removal only)
 };
 
-/// Create an InjectFaultPass instance.  If faultWriteSiteId <= 0 the pass
-/// is a no-op.
+/// Create an InjectFaultPass instance.
+/// Exactly one of faultWriteSiteId or faultCombSiteId must be nonzero.
+/// If both are zero the pass is a no-op.
 std::unique_ptr<mlir::Pass>
 createInjectFaultPass(InjectFaultPassOptions opts = {});
 

@@ -158,6 +158,18 @@ static llvm::cl::opt<int>
                             "is set (0-indexed from LSB)"),
              llvm::cl::init(0), llvm::cl::cat(mainCategory));
 
+static llvm::cl::opt<int>
+    faultCombSiteId("fault-comb-site-id",
+                    llvm::cl::desc("Comb site ID (comb_site_id) at which to "
+                                   "inject a guard-removal fault (0 = disabled)"),
+                    llvm::cl::init(0), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<int>
+    faultCombOperand("fault-comb-operand",
+                     llvm::cl::desc("Operand index to replace with the gate's "
+                                    "identity constant (guard-removal only)"),
+                     llvm::cl::init(0), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
                                         llvm::cl::init(true),
                                         llvm::cl::cat(mainCategory));
@@ -418,8 +430,9 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // Inject fault immediately after causality instrumentation so that
   // EmitCausality records the original (pre-fault) data flow, while
   // the state write receives the flipped value.
-  if (faultWriteSiteId > 0)
-    pm.addPass(arc::createInjectFaultPass({faultWriteSiteId, faultBit}));
+  if (faultWriteSiteId > 0 || faultCombSiteId > 0)
+    pm.addPass(arc::createInjectFaultPass(
+        {faultWriteSiteId, faultBit, faultCombSiteId, faultCombOperand}));
 
   // Allocate states.
   if (untilReached(UntilStateAlloc))
