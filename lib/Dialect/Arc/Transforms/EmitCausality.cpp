@@ -40,6 +40,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -146,20 +147,27 @@ private:
   // arc.state_write Operation* → 1-indexed write-site ID
   DenseMap<Operation *, int64_t> writeOpToSiteId;
 
+  // comb.and / comb.or Operation* → 1-indexed comb site ID
+  DenseMap<Operation *, int64_t> combOpToSiteId;
+
   // External function declarations added to the module
-  func::FuncOp beginDecl, addPredDecl, commitDecl;
+  func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl;
 
   void enumSignals();
   void enumWriteSites();
+  void enumCombSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
-  void walkValue(OpBuilder &b, Value val, DenseSet<Value> &visited);
+  void walkValue(OpBuilder &b, Value val, DenseSet<Value> &visited,
+                 DenseSet<std::pair<int64_t, int64_t>> &combSitesSeen);
 
   void emitBegin(OpBuilder &b, Location loc, int64_t sinkId, int64_t wsid,
                  Value newVal, int32_t numBits);
   void emitAddPred(OpBuilder &b, Location loc, int64_t predId, int8_t role,
                    int8_t delta);
+  void emitAddCombPred(OpBuilder &b, Location loc, int64_t siteId,
+                       int64_t operand, Value isIdentityI8);
   void emitCommit(OpBuilder &b, Location loc);
 
   Value toI64(OpBuilder &b, Location loc, Value val);
@@ -198,6 +206,7 @@ void EmitCausalityPass::runOnOperation() {
     return;
 
   enumSignals();
+  enumCombSites();
   enumWriteSites();
   writeSignalIndex();
   declareRuntimeFuncs();
@@ -244,6 +253,18 @@ void EmitCausalityPass::enumWriteSites() {
   int64_t counter = 1;
   module.walk([&](StateWriteOp op) {
     writeOpToSiteId[op.getOperation()] = counter++;
+  });
+}
+
+// =======================================================================
+// Phase 1c: enumerate comb.and / comb.or ops and assign comb site IDs
+// =======================================================================
+
+void EmitCausalityPass::enumCombSites() {
+  int64_t counter = 1;
+  module.walk([&](Operation *op) {
+    if (isa<comb::AndOp, comb::OrOp>(op))
+      combOpToSiteId[op] = counter++;
   });
 }
 
@@ -301,6 +322,21 @@ void EmitCausalityPass::writeSignalIndex() {
   });
   root["write_sites"] = llvm::json::Value(std::move(writeSites));
 
+  // Comb site table: one entry per comb.and / comb.or op, using the same
+  // deterministic walk order as enumCombSites().
+  llvm::json::Array combSites;
+  module.walk([&](Operation *op) {
+    if (!isa<comb::AndOp, comb::OrOp>(op))
+      return;
+    int64_t csid = combOpToSiteId.lookup(op);
+    llvm::json::Object e;
+    e["comb_site_id"] = csid;
+    e["gate"] = isa<comb::AndOp>(op) ? "and" : "or";
+    e["num_operands"] = static_cast<int64_t>(op->getNumOperands());
+    combSites.push_back(llvm::json::Value(std::move(e)));
+  });
+  root["comb_sites"] = llvm::json::Value(std::move(combSites));
+
   std::string outPath = opts.causalityDir + "/__signal_index.json";
   std::error_code ec;
   llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_None);
@@ -339,6 +375,8 @@ void EmitCausalityPass::declareRuntimeFuncs() {
                               FunctionType::get(ctx, {i64, i8, i8}, {}));
   commitDecl =
       getOrDeclare("causality_commit", FunctionType::get(ctx, {}, {}));
+  addCombPredDecl = getOrDeclare("causality_add_comb_pred",
+                                  FunctionType::get(ctx, {i64, i64, i8}, {}));
 }
 
 // =======================================================================
@@ -363,8 +401,9 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
 
   emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
   DenseSet<Value> visited;
+  DenseSet<std::pair<int64_t, int64_t>> combSitesSeen;
   gWalkDepth = 1;
-  walkValue(builder, writtenVal, visited);
+  walkValue(builder, writtenVal, visited, combSitesSeen);
   gWalkDepth = 0;
   emitCommit(builder, loc);
 }
@@ -397,7 +436,8 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
 //     coloring only, not injection site selection.
 // -----------------------------------------------------------------------
 void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
-                                   DenseSet<Value> &visited) {
+                                   DenseSet<Value> &visited,
+                                   DenseSet<std::pair<int64_t, int64_t>> &combSitesSeen) {
   if (!visited.insert(val).second) {
     dbg("(already visited, skip)");
     return;
@@ -435,7 +475,7 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
 
     dbg("comb.mux  -> walk cond unconditionally");
     ++gWalkDepth;
-    walkValue(builder, cond, visited);
+    walkValue(builder, cond, visited, combSitesSeen);
     --gWalkDepth;
 
     if (auto s = resolveDirectState(cond)) {
@@ -456,7 +496,7 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
       DenseSet<Value> thenVisited = visited;
       ++gWalkDepth;
       dbg("comb.mux  [then]:");
-      walkValue(builder, muxOp.getTrueValue(), thenVisited);
+      walkValue(builder, muxOp.getTrueValue(), thenVisited, combSitesSeen);
       --gWalkDepth;
     }
     {
@@ -465,7 +505,7 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
       DenseSet<Value> elseVisited = visited;
       ++gWalkDepth;
       dbg("comb.mux  [else]:");
-      walkValue(builder, muxOp.getFalseValue(), elseVisited);
+      walkValue(builder, muxOp.getFalseValue(), elseVisited, combSitesSeen);
       --gWalkDepth;
     }
     return;
@@ -498,6 +538,8 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
     dbg(llvm::Twine(isAnd ? "comb.and" : "comb.or") +
         "  " + llvm::Twine(operands.size()) + " operands, emitting guards");
 
+    int64_t siteId = combOpToSiteId.lookup(defOp);
+
     for (unsigned i = 0; i < operands.size(); ++i) {
       Value guardExpr;
       for (unsigned j = 0; j < operands.size(); ++j) {
@@ -512,10 +554,26 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
         }
       }
 
+      // Helper lambda: compute is_identity for operands[i] and return i8 Value.
+      // is_identity = (operands[i] == identity_const), extended to i8.
+      auto computeIsIdentity = [&]() -> Value {
+        unsigned W = cast<IntegerType>(operands[i].getType()).getWidth();
+        APInt identVal = isAnd ? APInt::getAllOnes(W) : APInt(W, 0);
+        Value identConst = builder.create<arith::ConstantOp>(
+            loc, builder.getIntegerAttr(operands[i].getType(), identVal));
+        Value cmpI1 = builder.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, operands[i], identConst);
+        return builder.create<arith::ExtUIOp>(loc, builder.getI8Type(), cmpI1);
+      };
+
       if (!guardExpr) {
         dbg("  operand[" + llvm::Twine(i) + "] single-operand gate, walk unconditionally");
+        if (combSitesSeen.insert({siteId, static_cast<int64_t>(i)}).second) {
+          Value isIdentityI8 = computeIsIdentity();
+          emitAddCombPred(builder, loc, siteId, static_cast<int64_t>(i), isIdentityI8);
+        }
         ++gWalkDepth;
-        walkValue(builder, operands[i], visited);
+        walkValue(builder, operands[i], visited, combSitesSeen);
         --gWalkDepth;
         continue;
       }
@@ -533,9 +591,13 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
       {
         OpBuilder::InsertionGuard g(builder);
         builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+        if (combSitesSeen.insert({siteId, static_cast<int64_t>(i)}).second) {
+          Value isIdentityI8 = computeIsIdentity();
+          emitAddCombPred(builder, loc, siteId, static_cast<int64_t>(i), isIdentityI8);
+        }
         DenseSet<Value> branchVisited = visited;
         ++gWalkDepth;
-        walkValue(builder, operands[i], branchVisited);
+        walkValue(builder, operands[i], branchVisited, combSitesSeen);
         --gWalkDepth;
       }
     }
@@ -547,7 +609,7 @@ void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
       "  " + llvm::Twine(defOp->getNumOperands()) + " operands -> recurse all");
   ++gWalkDepth;
   for (Value operand : defOp->getOperands())
-    walkValue(builder, operand, visited);
+    walkValue(builder, operand, visited, combSitesSeen);
   --gWalkDepth;
 }
 
@@ -569,6 +631,14 @@ void EmitCausalityPass::emitAddPred(OpBuilder &b, Location loc, int64_t predId,
   b.create<func::CallOp>(
       loc, addPredDecl,
       ValueRange{cI64(b, loc, predId), cI8(b, loc, role), cI8(b, loc, delta)});
+}
+
+void EmitCausalityPass::emitAddCombPred(OpBuilder &b, Location loc,
+                                         int64_t siteId, int64_t operand,
+                                         Value isIdentityI8) {
+  b.create<func::CallOp>(
+      loc, addCombPredDecl,
+      ValueRange{cI64(b, loc, siteId), cI64(b, loc, operand), isIdentityI8});
 }
 
 void EmitCausalityPass::emitCommit(OpBuilder &b, Location loc) {
