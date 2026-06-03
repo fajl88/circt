@@ -13,17 +13,22 @@
 //   1. (Compile-time) Enumerate all state handles, assign sequential IDs,
 //      write __signal_index.json to causalityDir/.
 //   2. (Instrumentation) For every arc.state_write, emit one causality_begin /
-//      causality_commit pair around a recursive walk of the written value's
-//      combinational expression.  The walk emits causality_add_pred calls at
-//      arc.state_read leaves (DATA role) and inserts scf.if guards at every
-//      comb.mux so that only the runtime-active branch's state reads become
-//      predecessors of the event.  Mux conditions that are direct state reads
-//      also get a CONTROL_GUARD predecessor.
+//      causality_commit pair around a call to a memoized value recorder.
+//      Each SSA Value in the cone gets ONE private func.func ("recorder") that
+//      emits exactly the add_pred / add_comb_pred calls it contributes, with
+//      scf.if guards preserved for path-sensitive branching.  Recorders are
+//      shared across all callers: a reconvergent sub-expression is emitted once
+//      rather than duplicated per path, collapsing O(paths) IR blowup to
+//      O(nodes).
 //
-// Every state write is instrumented unconditionally so that backward slicing
-// can follow predecessor chains transitively through the full circuit.  The
-// --causality-sinks command-line option is currently ignored (it used to
-// restrict instrumentation to a hand-picked subset of observable signals).
+// Correctness argument for memoization:
+//   - The predecessor contribution of a value V depends only on V's own
+//     combinational cone, never on which path led to V.
+//   - The runtime (causality_runtime.cc) deduplicates predecessors by
+//     (pred_id, role, time_delta) and comb-preds by (comb_site_id, operand_idx)
+//     at commit time, so call multiplicity is irrelevant to the result.
+//   - Guarding (scf.if) is fully preserved in each recorder body, so only the
+//     runtime-taken branch's state reads contribute predecessors.
 //
 // Registration: this pass is registered manually in arcilator.cpp (not via
 // ArcPasses.td) so that touching ArcPasses.td and triggering a full rebuild
@@ -43,6 +48,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
@@ -55,8 +61,7 @@ using namespace mlir;
 
 // ---------------------------------------------------------------------------
 // Debug logging: set CAUSALITY_DEBUG=1 in the environment before running
-// arcilator to get a per-write-site trace of every operation visited, every
-// guard emitted, and every add_pred call generated.
+// arcilator to get a per-write-site trace of every recorder built.
 // ---------------------------------------------------------------------------
 static bool causalityDebug() {
   static int cached = -1;
@@ -65,12 +70,8 @@ static bool causalityDebug() {
   return cached == 1;
 }
 
-// Indent level for nested walkValue calls.
-static thread_local int gWalkDepth = 0;
-
 static void dbg(const llvm::Twine &msg) {
   if (!causalityDebug()) return;
-  for (int i = 0; i < gWalkDepth; ++i) llvm::errs() << "  ";
   llvm::errs() << "[causality] " << msg << "\n";
 }
 
@@ -153,14 +154,42 @@ private:
   // External function declarations added to the module
   func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl;
 
+  // -----------------------------------------------------------------------
+  // Memoized recorder functions.
+  //
+  // Each SSA Value in the combinational cone gets ONE private func.func that
+  // emits the add_pred / add_comb_pred calls that value contributes, with all
+  // scf.if guards preserved.  Recorders are shared across every call site that
+  // reaches that value (mux branches, multiple write sites), collapsing the
+  // O(paths) IR blowup of the old inline-recursive approach to O(nodes).
+  //
+  // RecorderInfo holds:
+  //   funcOp  — the emitted function.
+  //   liveIns — the ordered set of model-body SSA values that must be passed
+  //             as call arguments (mux conditions, and/or operands needed for
+  //             runtime guards inside the recorder body).
+  // -----------------------------------------------------------------------
+  struct RecorderInfo {
+    func::FuncOp funcOp;
+    SmallVector<Value> liveIns;
+  };
+  DenseMap<Value, RecorderInfo> recorderCache;
+  unsigned recorderCounter = 0;
+
+  // Emit or retrieve the memoized recorder for a given SSA value.
+  RecorderInfo getOrEmitRecorder(Value val);
+
+  // Emit a func.call to a recorder, mapping its liveIns through argMap
+  // (model-SSA-value → block-arg of the enclosing recorder body).
+  void emitRecorderCall(OpBuilder &b, Location loc, const RecorderInfo &info,
+                        const DenseMap<Value, Value> &argMap);
+
   void enumSignals();
   void enumWriteSites();
   void enumCombSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
-  void walkValue(OpBuilder &b, Value val, DenseSet<Value> &visited,
-                 DenseSet<std::pair<int64_t, int64_t>> &combSitesSeen);
 
   void emitBegin(OpBuilder &b, Location loc, int64_t sinkId, int64_t wsid,
                  Value newVal, int32_t numBits);
@@ -204,6 +233,10 @@ void EmitCausalityPass::runOnOperation() {
 
   if (opts.causalityDir.empty())
     return;
+
+  // Reset memoization state (pass instance may be reused across modules).
+  recorderCache.clear();
+  recorderCounter = 0;
 
   enumSignals();
   enumCombSites();
@@ -400,217 +433,354 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
       " bits=" + llvm::Twine(numBits));
 
   emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
-  DenseSet<Value> visited;
-  DenseSet<std::pair<int64_t, int64_t>> combSitesSeen;
-  gWalkDepth = 1;
-  walkValue(builder, writtenVal, visited, combSitesSeen);
-  gWalkDepth = 0;
+
+  // Get or build the shared recorder for writtenVal, then call it.
+  // The recorder's liveIns are model SSA values directly available here.
+  RecorderInfo info = getOrEmitRecorder(writtenVal);
+  builder.create<func::CallOp>(loc, info.funcOp,
+                                ValueRange(info.liveIns));
+
   emitCommit(builder, loc);
 }
 
-// -----------------------------------------------------------------------
-// walkValue: recursively descend through a combinational expression, emitting
-//   - DATA add_pred at every arc.state_read leaf,
-//   - scf.if-guarded sub-walks at every comb.mux (only the executed branch's
-//     state reads become predecessors of the current event),
-//   - CONTROL_GUARD add_pred when a mux condition is a direct state read.
+// =======================================================================
+// getOrEmitRecorder: memoized per-value recorder emission
 //
-// The `visited` set prevents redundant descent into CSE-shared subexpressions
-// within a single straight-line walk. It is passed by reference so insertions
-// accumulate across sibling operands of the same parent op. At each scf.if
-// boundary we COPY the current visited set into the then/else branches: this
-// (a) inherits dedup state from the parent context (a state read already
-// emitted unconditionally before the scf.if must not be re-emitted inside the
-// branch, since the parent's add_pred always fires), and (b) keeps the two
-// branches independent of each other (a state read referenced in both
-// branches must be emitted in each, because only one branch's IR runs at
-// runtime).
+// For each distinct SSA value in the combinational cone, emit ONE private
+// func.func at module level and cache it.  The function body mirrors the
+// original walkValue logic but uses calls to child recorders instead of
+// inline re-walks, and scf.if guards are preserved for path-sensitivity.
 //
-// OVERAPPROXIMATION (known, minor):
-//   - comb.extract: a fault in bits outside the extracted range cannot
-//     propagate. Fixing requires per-bit range tracking across the walk —
-//     non-trivial and rare in practice.
-//   - comb.mux conditions that are complex sub-expressions (not direct
-//     arc.state_reads) are walked as DATA, missing CONTROL_GUARD tagging for
-//     the state reads inside the condition. Cosmetic: affects slicer edge
-//     coloring only, not injection site selection.
-// -----------------------------------------------------------------------
-void EmitCausalityPass::walkValue(OpBuilder &builder, Value val,
-                                   DenseSet<Value> &visited,
-                                   DenseSet<std::pair<int64_t, int64_t>> &combSitesSeen) {
-  if (!visited.insert(val).second) {
-    dbg("(already visited, skip)");
-    return;
-  }
+// Live-in collection:
+//   The recorder body needs certain model SSA values at runtime (mux conds
+//   and and/or operands, to evaluate guards).  These become function args.
+//   The ordered set is computed while building each recorder by unioning the
+//   values it directly references with the liveIns of every child recorder.
+// =======================================================================
 
+EmitCausalityPass::RecorderInfo
+EmitCausalityPass::getOrEmitRecorder(Value val) {
+  // Return cached recorder if already built.
+  auto it = recorderCache.find(val);
+  if (it != recorderCache.end())
+    return it->second;
+
+  Location loc = val.getLoc();
   Operation *defOp = val.getDefiningOp();
-  if (!defOp) {
-    dbg("block-arg / constant (no defOp), skip");
-    return;
+
+  // -----------------------------------------------------------------------
+  // Boundary: block arg (no defOp), StateWriteOp boundary, or zero-operand
+  // op (e.g. hw.constant).  No predecessor state reads reachable → empty
+  // recorder.
+  // -----------------------------------------------------------------------
+  if (!defOp || isa<StateWriteOp>(defOp) || defOp->getNumOperands() == 0) {
+    auto funcType = FunctionType::get(ctx, {}, {});
+    OpBuilder b(ctx);
+    b.setInsertionPointToEnd(module.getBody());
+    std::string name = "__caus_rec_" + std::to_string(recorderCounter++);
+    dbg("boundary -> empty recorder " + name);
+    auto recFunc = b.create<func::FuncOp>(loc, name, funcType);
+    recFunc.setVisibility(SymbolTable::Visibility::Private);
+    Block *body = recFunc.addEntryBlock();
+    OpBuilder bodyBuilder(body, body->end());
+    bodyBuilder.create<func::ReturnOp>(loc);
+    RecorderInfo info{recFunc, {}};
+    recorderCache[val] = info;
+    return info;
   }
 
-  // Stop at state-write boundaries: a written register is a separate event,
-  // not a predecessor reached through combinational logic.
-  if (isa<StateWriteOp>(defOp)) {
-    dbg("stop at StateWriteOp boundary");
-    return;
-  }
-
-  // Leaf: arc.state_read becomes a DATA predecessor.
+  // -----------------------------------------------------------------------
+  // arc.state_read leaf: emit a single DATA add_pred call.
+  // -----------------------------------------------------------------------
   if (auto readOp = dyn_cast<StateReadOp>(defOp)) {
     int64_t predId = lookupId(readOp.getState());
     StringRef name = getStateName(readOp.getState());
     dbg("state_read id=" + llvm::Twine(predId) +
-        " (" + (name.empty() ? "?" : name) + ")" +
-        " -> add_pred(DATA)");
+        " (" + (name.empty() ? "?" : name) + ") -> recorder with add_pred(DATA)");
+    auto funcType = FunctionType::get(ctx, {}, {});
+    OpBuilder b(ctx);
+    b.setInsertionPointToEnd(module.getBody());
+    std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+    auto recFunc = b.create<func::FuncOp>(loc, recName, funcType);
+    recFunc.setVisibility(SymbolTable::Visibility::Private);
+    Block *body = recFunc.addEntryBlock();
+    OpBuilder bodyBuilder(body, body->end());
     if (predId != -1)
-      emitAddPred(builder, readOp.getLoc(), predId, ROLE_DATA, -1);
-    return;
+      emitAddPred(bodyBuilder, loc, predId, ROLE_DATA, -1);
+    bodyBuilder.create<func::ReturnOp>(loc);
+    RecorderInfo info{recFunc, {}};
+    recorderCache[val] = info;
+    return info;
   }
 
-  // Path-sensitive split: comb.mux executes only one of its data operands.
+  // -----------------------------------------------------------------------
+  // comb.mux: path-sensitive split.
+  //
+  // Recorder body:
+  //   call rec_cond(...)          -- DATA predecessors of the condition
+  //   [add_pred(cid, CONTROL_GUARD)] -- if cond is a direct state read
+  //   if (cond) { call rec_true(...) } else { call rec_false(...) }
+  //
+  // Live-ins: {cond} ∪ liveIns(rec_cond) ∪ liveIns(rec_true) ∪ liveIns(rec_false)
+  // -----------------------------------------------------------------------
   if (auto muxOp = dyn_cast<comb::MuxOp>(defOp)) {
-    Value cond = muxOp.getCond();
-    Location muxLoc = muxOp.getLoc();
+    Value cond     = muxOp.getCond();
+    Value trueVal  = muxOp.getTrueValue();
+    Value falseVal = muxOp.getFalseValue();
 
-    dbg("comb.mux  -> walk cond unconditionally");
-    ++gWalkDepth;
-    walkValue(builder, cond, visited, combSitesSeen);
-    --gWalkDepth;
+    dbg("comb.mux -> build mux recorder");
+    RecorderInfo condInfo  = getOrEmitRecorder(cond);
+    RecorderInfo trueInfo  = getOrEmitRecorder(trueVal);
+    RecorderInfo falseInfo = getOrEmitRecorder(falseVal);
 
+    llvm::SetVector<Value> liveInSet;
+    liveInSet.insert(cond);
+    for (auto v : condInfo.liveIns)  liveInSet.insert(v);
+    for (auto v : trueInfo.liveIns)  liveInSet.insert(v);
+    for (auto v : falseInfo.liveIns) liveInSet.insert(v);
+    SmallVector<Value> liveIns(liveInSet.begin(), liveInSet.end());
+
+    SmallVector<Type> argTypes;
+    for (auto v : liveIns) argTypes.push_back(v.getType());
+    auto funcType = FunctionType::get(ctx, argTypes, {});
+
+    OpBuilder modBuilder(ctx);
+    modBuilder.setInsertionPointToEnd(module.getBody());
+    std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+    auto recFunc = modBuilder.create<func::FuncOp>(loc, recName, funcType);
+    recFunc.setVisibility(SymbolTable::Visibility::Private);
+
+    // Cache before building body (acyclic, but good hygiene).
+    RecorderInfo info{recFunc, liveIns};
+    recorderCache[val] = info;
+
+    Block *body = recFunc.addEntryBlock();
+    OpBuilder bodyBuilder(body, body->end());
+
+    // Map model SSA values → block args of this recorder.
+    DenseMap<Value, Value> argMap;
+    for (auto [modelVal, blockArg] :
+         llvm::zip(liveIns, body->getArguments()))
+      argMap[modelVal] = blockArg;
+
+    // 1. Walk the condition (DATA predecessors).
+    emitRecorderCall(bodyBuilder, loc, condInfo, argMap);
+
+    // 2. CONTROL_GUARD if condition is a direct state read.
     if (auto s = resolveDirectState(cond)) {
       int64_t cid = lookupId(s);
-      StringRef name = getStateName(s);
-      dbg("comb.mux  cond is direct state_read id=" + llvm::Twine(cid) +
-          " (" + (name.empty() ? "?" : name) + ") -> add_pred(CONTROL_GUARD)");
       if (cid != -1)
-        emitAddPred(builder, muxLoc, cid, ROLE_CONTROL_GUARD, -1);
+        emitAddPred(bodyBuilder, loc, cid, ROLE_CONTROL_GUARD, -1);
     }
 
-    dbg("comb.mux  emit scf.if; then-branch walks trueVal, else-branch walks falseVal");
+    // 3. Branch on runtime cond: only the taken arm contributes DATA preds.
+    Value mappedCond = argMap[cond];
     auto ifOp =
-        builder.create<scf::IfOp>(muxLoc, cond, /*withElseRegion=*/true);
+        bodyBuilder.create<scf::IfOp>(loc, mappedCond, /*withElseRegion=*/true);
     {
-      OpBuilder::InsertionGuard g(builder);
-      builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
-      DenseSet<Value> thenVisited = visited;
-      ++gWalkDepth;
-      dbg("comb.mux  [then]:");
-      walkValue(builder, muxOp.getTrueValue(), thenVisited, combSitesSeen);
-      --gWalkDepth;
+      OpBuilder::InsertionGuard g(bodyBuilder);
+      bodyBuilder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+      emitRecorderCall(bodyBuilder, loc, trueInfo, argMap);
     }
     {
-      OpBuilder::InsertionGuard g(builder);
-      builder.setInsertionPoint(ifOp.elseBlock()->getTerminator());
-      DenseSet<Value> elseVisited = visited;
-      ++gWalkDepth;
-      dbg("comb.mux  [else]:");
-      walkValue(builder, muxOp.getFalseValue(), elseVisited, combSitesSeen);
-      --gWalkDepth;
+      OpBuilder::InsertionGuard g(bodyBuilder);
+      bodyBuilder.setInsertionPoint(ifOp.elseBlock()->getTerminator());
+      emitRecorderCall(bodyBuilder, loc, falseInfo, argMap);
     }
-    return;
+
+    bodyBuilder.create<func::ReturnOp>(loc);
+    return info;
   }
 
-  // Path-sensitive: comb.and / comb.or short-circuit masking.
+  // -----------------------------------------------------------------------
+  // comb.and / comb.or: short-circuit masking guards.
   //
-  // A single-bit fault in operand i propagates through a gate only when the
-  // other operands do not already force the output to a fixed value:
-  //   AND: operand i matters only when AND(all others) != 0
-  //         (if any other operand is 0, the output is stuck at 0 regardless)
-  //   OR:  operand i matters only when OR(all others) == 0
-  //         (if any other operand is 1, the output is stuck at 1 regardless)
+  // For each operand i, the guard is AND/OR of the other operands:
+  //   AND: operand i matters only when AND(others) != 0
+  //   OR:  operand i matters only when OR(others) == 0
   //
-  // For each operand we compute the AND/OR of the remaining ones at compile
-  // time (as an arith expression over the already-live SSA values), then emit
-  // a runtime scf.if guard before recursing into that operand's sub-tree.
+  // Recorder body (per operand i):
+  //   guardExpr = AND/OR of mapped operands[j!=i]
+  //   if single operand: add_comb_pred + call rec_operand_i (unconditional)
+  //   otherwise:         if (guardExpr) { add_comb_pred; call rec_operand_i }
   //
-  // Corner cases:
-  //   - N=1: single operand always propagates; walk unconditionally.
-  //   - AND, two operands both 0 (or OR, two operands both 1): guards for
-  //     both operands evaluate to false at runtime, so zero add_pred calls
-  //     are emitted. This is correct: no single-bit flip can change the
-  //     output in that configuration.
+  // Live-ins: all operands (for guard computation) ∪ child live-ins
+  // -----------------------------------------------------------------------
   if (isa<comb::AndOp, comb::OrOp>(defOp)) {
     const bool isAnd = isa<comb::AndOp>(defOp);
     OperandRange operands = defOp->getOperands();
-    Location loc = defOp->getLoc();
-
-    dbg(llvm::Twine(isAnd ? "comb.and" : "comb.or") +
-        "  " + llvm::Twine(operands.size()) + " operands, emitting guards");
-
     int64_t siteId = combOpToSiteId.lookup(defOp);
 
+    dbg(llvm::Twine(isAnd ? "comb.and" : "comb.or") +
+        " " + llvm::Twine(operands.size()) + " operands -> build and/or recorder");
+
+    SmallVector<RecorderInfo> operandInfos;
+    for (auto operand : operands)
+      operandInfos.push_back(getOrEmitRecorder(operand));
+
+    llvm::SetVector<Value> liveInSet;
+    for (auto operand : operands)
+      liveInSet.insert(operand);
+    for (auto &oi : operandInfos)
+      for (auto v : oi.liveIns)
+        liveInSet.insert(v);
+    SmallVector<Value> liveIns(liveInSet.begin(), liveInSet.end());
+
+    SmallVector<Type> argTypes;
+    for (auto v : liveIns) argTypes.push_back(v.getType());
+    auto funcType = FunctionType::get(ctx, argTypes, {});
+
+    OpBuilder modBuilder(ctx);
+    modBuilder.setInsertionPointToEnd(module.getBody());
+    std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+    auto recFunc = modBuilder.create<func::FuncOp>(loc, recName, funcType);
+    recFunc.setVisibility(SymbolTable::Visibility::Private);
+
+    RecorderInfo info{recFunc, liveIns};
+    recorderCache[val] = info;
+
+    Block *body = recFunc.addEntryBlock();
+    OpBuilder bodyBuilder(body, body->end());
+
+    DenseMap<Value, Value> argMap;
+    for (auto [modelVal, blockArg] :
+         llvm::zip(liveIns, body->getArguments()))
+      argMap[modelVal] = blockArg;
+
+    SmallVector<Value> mappedOperands;
+    for (auto operand : operands)
+      mappedOperands.push_back(argMap[operand]);
+
     for (unsigned i = 0; i < operands.size(); ++i) {
+      // Build guardExpr = AND/OR of all operands except i.
       Value guardExpr;
       for (unsigned j = 0; j < operands.size(); ++j) {
         if (j == i)
           continue;
         if (!guardExpr) {
-          guardExpr = operands[j];
+          guardExpr = mappedOperands[j];
         } else if (isAnd) {
-          guardExpr = builder.create<arith::AndIOp>(loc, guardExpr, operands[j]);
+          guardExpr =
+              bodyBuilder.create<arith::AndIOp>(loc, guardExpr, mappedOperands[j]);
         } else {
-          guardExpr = builder.create<arith::OrIOp>(loc, guardExpr, operands[j]);
+          guardExpr =
+              bodyBuilder.create<arith::OrIOp>(loc, guardExpr, mappedOperands[j]);
         }
       }
 
-      // Helper lambda: compute is_identity for operands[i] and return i8 Value.
-      // is_identity = (operands[i] == identity_const), extended to i8.
+      // is_identity: operands[i] == identity element (all-ones for AND, 0 for OR).
       auto computeIsIdentity = [&]() -> Value {
-        unsigned W = cast<IntegerType>(operands[i].getType()).getWidth();
+        unsigned W =
+            cast<IntegerType>(mappedOperands[i].getType()).getWidth();
         APInt identVal = isAnd ? APInt::getAllOnes(W) : APInt(W, 0);
-        Value identConst = builder.create<arith::ConstantOp>(
-            loc, builder.getIntegerAttr(operands[i].getType(), identVal));
-        Value cmpI1 = builder.create<arith::CmpIOp>(
-            loc, arith::CmpIPredicate::eq, operands[i], identConst);
-        return builder.create<arith::ExtUIOp>(loc, builder.getI8Type(), cmpI1);
+        Value identConst = bodyBuilder.create<arith::ConstantOp>(
+            loc,
+            bodyBuilder.getIntegerAttr(mappedOperands[i].getType(), identVal));
+        Value cmpI1 = bodyBuilder.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, mappedOperands[i], identConst);
+        return bodyBuilder.create<arith::ExtUIOp>(loc, bodyBuilder.getI8Type(),
+                                                   cmpI1);
       };
 
       if (!guardExpr) {
-        dbg("  operand[" + llvm::Twine(i) + "] single-operand gate, walk unconditionally");
-        if (combSitesSeen.insert({siteId, static_cast<int64_t>(i)}).second) {
-          Value isIdentityI8 = computeIsIdentity();
-          emitAddCombPred(builder, loc, siteId, static_cast<int64_t>(i), isIdentityI8);
-        }
-        ++gWalkDepth;
-        walkValue(builder, operands[i], visited, combSitesSeen);
-        --gWalkDepth;
+        // Single-operand gate: always propagates.
+        Value isIdentityI8 = computeIsIdentity();
+        emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
+                        isIdentityI8);
+        emitRecorderCall(bodyBuilder, loc, operandInfos[i], argMap);
         continue;
       }
 
-      Value zero = builder.create<arith::ConstantOp>(
-          loc, builder.getIntegerAttr(guardExpr.getType(), 0));
+      // Multi-operand: guard the walk.
+      Value zero = bodyBuilder.create<arith::ConstantOp>(
+          loc, bodyBuilder.getIntegerAttr(guardExpr.getType(), 0));
       arith::CmpIPredicate cmpPred =
           isAnd ? arith::CmpIPredicate::ne : arith::CmpIPredicate::eq;
-      Value cond = builder.create<arith::CmpIOp>(loc, cmpPred, guardExpr, zero);
+      Value guardCond =
+          bodyBuilder.create<arith::CmpIOp>(loc, cmpPred, guardExpr, zero);
 
-      dbg("  operand[" + llvm::Twine(i) + "] guard: " +
-          (isAnd ? "AND(others)!=0" : "OR(others)==0") +
-          " -> scf.if");
-      auto ifOp = builder.create<scf::IfOp>(loc, cond, /*withElseRegion=*/false);
+      auto ifOp = bodyBuilder.create<scf::IfOp>(loc, guardCond,
+                                                  /*withElseRegion=*/false);
       {
-        OpBuilder::InsertionGuard g(builder);
-        builder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
-        if (combSitesSeen.insert({siteId, static_cast<int64_t>(i)}).second) {
-          Value isIdentityI8 = computeIsIdentity();
-          emitAddCombPred(builder, loc, siteId, static_cast<int64_t>(i), isIdentityI8);
-        }
-        DenseSet<Value> branchVisited = visited;
-        ++gWalkDepth;
-        walkValue(builder, operands[i], branchVisited, combSitesSeen);
-        --gWalkDepth;
+        OpBuilder::InsertionGuard g(bodyBuilder);
+        bodyBuilder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+        Value isIdentityI8 = computeIsIdentity();
+        emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
+                        isIdentityI8);
+        emitRecorderCall(bodyBuilder, loc, operandInfos[i], argMap);
       }
     }
-    return;
+
+    bodyBuilder.create<func::ReturnOp>(loc);
+    return info;
   }
 
-  // Generic combinational op: log the op name and recurse into all operands.
-  dbg(defOp->getName().getStringRef() +
-      "  " + llvm::Twine(defOp->getNumOperands()) + " operands -> recurse all");
-  ++gWalkDepth;
-  for (Value operand : defOp->getOperands())
-    walkValue(builder, operand, visited, combSitesSeen);
-  --gWalkDepth;
+  // -----------------------------------------------------------------------
+  // Generic combinational op: no runtime guards, just recurse all operands.
+  // Live-ins: union of child live-ins only (operands not needed directly).
+  // -----------------------------------------------------------------------
+  SmallVector<RecorderInfo> operandInfos;
+  for (auto operand : defOp->getOperands())
+    operandInfos.push_back(getOrEmitRecorder(operand));
+
+  {
+    llvm::SetVector<Value> liveInSet;
+    for (auto &oi : operandInfos)
+      for (auto v : oi.liveIns)
+        liveInSet.insert(v);
+    SmallVector<Value> liveIns(liveInSet.begin(), liveInSet.end());
+
+    SmallVector<Type> argTypes;
+    for (auto v : liveIns) argTypes.push_back(v.getType());
+    auto funcType = FunctionType::get(ctx, argTypes, {});
+
+    OpBuilder modBuilder(ctx);
+    modBuilder.setInsertionPointToEnd(module.getBody());
+    std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+    dbg("generic op " + defOp->getName().getStringRef() +
+        " -> recorder " + recName);
+    auto recFunc = modBuilder.create<func::FuncOp>(loc, recName, funcType);
+    recFunc.setVisibility(SymbolTable::Visibility::Private);
+
+    RecorderInfo info{recFunc, liveIns};
+    recorderCache[val] = info;
+
+    Block *body = recFunc.addEntryBlock();
+    OpBuilder bodyBuilder(body, body->end());
+
+    DenseMap<Value, Value> argMap;
+    for (auto [modelVal, blockArg] :
+         llvm::zip(liveIns, body->getArguments()))
+      argMap[modelVal] = blockArg;
+
+    for (auto &oi : operandInfos)
+      emitRecorderCall(bodyBuilder, loc, oi, argMap);
+
+    bodyBuilder.create<func::ReturnOp>(loc);
+    return info;
+  }
+}
+
+// -----------------------------------------------------------------------
+// emitRecorderCall: emit a func.call to a recorder, mapping its liveIns
+// through argMap (model-SSA → enclosing recorder's block arg).
+// -----------------------------------------------------------------------
+void EmitCausalityPass::emitRecorderCall(OpBuilder &b, Location loc,
+                                          const RecorderInfo &info,
+                                          const DenseMap<Value, Value> &argMap) {
+  if (info.liveIns.empty()) {
+    b.create<func::CallOp>(loc, info.funcOp, ValueRange{});
+    return;
+  }
+  SmallVector<Value> callArgs;
+  callArgs.reserve(info.liveIns.size());
+  for (auto modelVal : info.liveIns) {
+    auto it = argMap.find(modelVal);
+    assert(it != argMap.end() &&
+           "recorder live-in not found in caller argMap");
+    callArgs.push_back(it->second);
+  }
+  b.create<func::CallOp>(loc, info.funcOp, callArgs);
 }
 
 // =======================================================================
