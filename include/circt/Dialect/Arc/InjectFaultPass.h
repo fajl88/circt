@@ -23,9 +23,19 @@ struct InjectFaultPassOptions {
 
 /// Create an InjectFaultPass instance.
 /// Exactly one of faultWriteSiteId or faultCombSiteId must be nonzero.
-/// If both are zero the pass is a no-op.
+/// If both are zero the pass runs in "marked" mode (see below) and is a no-op
+/// unless the module carries `trace.fault_target` attributes.
 std::unique_ptr<mlir::Pass>
 createInjectFaultPass(InjectFaultPassOptions opts = {});
+
+/// Register InjectFault as a circt-opt pass (`--arc-inject-fault`).  Declared
+/// here and called explicitly from circt-opt.cpp so the static registration is
+/// not dropped by the linker (the Arc transforms lib is otherwise unreferenced
+/// by circt-opt).  With no CLI options the pass runs in "marked" mode: it
+/// removes the guard on every comb.and/comb.or carrying an integer
+/// `trace.fault_target = <operand-index>` attribute.  This avoids needing
+/// tablegen Pass::Options on a manually-declared pass.
+void registerInjectFaultPass();
 
 } // namespace arc
 } // namespace circt

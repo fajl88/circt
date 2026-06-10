@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/Arc/InjectFaultPass.h"
 #include "circt/InitAllDialects.h"
 #include "circt/InitAllPasses.h"
 #include "circt/Support/LoweringOptions.h"
@@ -84,6 +85,11 @@ int main(int argc, char **argv) {
   circt::test::registerAnalysisTestPasses();
   mlir::registerSROA();
   mlir::registerMem2RegPass();
+
+  // Arc passes declared manually (outside ArcPasses.td) — register explicitly so
+  // the static registration is not dropped by the linker.  Used by the
+  // formal-verification flow to produce a faulted top.mlir for ExportVerilog.
+  circt::arc::registerInjectFaultPass();
 
   return mlir::failed(mlir::MlirOptMain(
       argc, argv, "CIRCT modular optimizer driver", registry));

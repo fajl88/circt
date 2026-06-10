@@ -43,6 +43,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APInt.h"
@@ -294,10 +295,24 @@ void EmitCausalityPass::enumWriteSites() {
 // =======================================================================
 
 void EmitCausalityPass::enumCombSites() {
-  int64_t counter = 1;
+  // Source-anchored comb-site IDs: each comb.and/comb.or carries a stable
+  // `trace.comb_site_id` attribute assigned at the top.mlir level (before
+  // arc lowering / inlining) by the comb-site tagging build step.  We READ that
+  // id rather than re-counting, so the id names the same SOURCE gate in the
+  // causality trace, the simulated fault, and the ExportVerilog miter — even
+  // though inlining duplicates a source gate into many arc-level copies (all
+  // copies inherit the same id, and the runtime de-dups comb-preds by
+  // (comb_site_id, operand_idx), so the per-source view falls out for free).
+  //
+  // Comb ops WITHOUT the attribute were synthesized during lowering and have no
+  // source counterpart; they get no id (lookup returns 0) and are skipped as
+  // injection candidates, while the path-sensitive walk still descends through
+  // them (see getOrEmitRecorder).
   module.walk([&](Operation *op) {
-    if (isa<comb::AndOp, comb::OrOp>(op))
-      combOpToSiteId[op] = counter++;
+    if (!isa<comb::AndOp, comb::OrOp>(op))
+      return;
+    if (auto a = op->getAttrOfType<IntegerAttr>("trace.comb_site_id"))
+      combOpToSiteId[op] = a.getInt();
   });
 }
 
@@ -355,13 +370,21 @@ void EmitCausalityPass::writeSignalIndex() {
   });
   root["write_sites"] = llvm::json::Value(std::move(writeSites));
 
-  // Comb site table: one entry per comb.and / comb.or op, using the same
-  // deterministic walk order as enumCombSites().
+  // Comb site table: one entry per SOURCE comb.and / comb.or (keyed by the
+  // source-anchored trace.comb_site_id).  Inlining duplicates a source gate into
+  // many arc-level copies sharing one id; we emit a single entry per id (the
+  // first copy seen).  Untagged synthesized gates (id 0) are not injection
+  // candidates and are skipped.
   llvm::json::Array combSites;
+  llvm::DenseSet<int64_t> seenCombIds;
   module.walk([&](Operation *op) {
     if (!isa<comb::AndOp, comb::OrOp>(op))
       return;
     int64_t csid = combOpToSiteId.lookup(op);
+    if (csid == 0)
+      return;
+    if (!seenCombIds.insert(csid).second)
+      return;
     llvm::json::Object e;
     e["comb_site_id"] = csid;
     e["gate"] = isa<comb::AndOp>(op) ? "and" : "or";
@@ -683,10 +706,12 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
       };
 
       if (!guardExpr) {
-        // Single-operand gate: always propagates.
-        Value isIdentityI8 = computeIsIdentity();
-        emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
-                        isIdentityI8);
+        // Single-operand gate: always propagates.  Record the comb-pred only
+        // for tagged (source-anchored) gates; untagged synthesized gates still
+        // have their operand walked, just not recorded as injection candidates.
+        if (siteId != 0)
+          emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
+                          computeIsIdentity());
         emitRecorderCall(bodyBuilder, loc, operandInfos[i], argMap);
         continue;
       }
@@ -704,9 +729,9 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
       {
         OpBuilder::InsertionGuard g(bodyBuilder);
         bodyBuilder.setInsertionPoint(ifOp.thenBlock()->getTerminator());
-        Value isIdentityI8 = computeIsIdentity();
-        emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
-                        isIdentityI8);
+        if (siteId != 0)
+          emitAddCombPred(bodyBuilder, loc, siteId, static_cast<int64_t>(i),
+                          computeIsIdentity());
         emitRecorderCall(bodyBuilder, loc, operandInfos[i], argMap);
       }
     }

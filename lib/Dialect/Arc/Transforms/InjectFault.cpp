@@ -29,9 +29,13 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
+#include <utility>
 
 using namespace circt;
 using namespace arc;
@@ -90,23 +94,55 @@ static StateWriteOp findWriteOpById(ModuleOp module, int64_t targetId) {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: enumerate comb.and / comb.or ops in the same deterministic walk
-// order used by EmitCausality::enumCombSites().  Must stay in sync.
+// Helpers: locate comb.and / comb.or guard-removal targets.
+//
+// Guard-removal is source-anchored: each comb.and/comb.or carries a stable
+// `trace.comb_site_id` attribute (assigned at the top.mlir level, before arc
+// lowering / inlining, by EmitCausality's tagging step).  A single source gate
+// may be inlined into many copies, all sharing the same id; faulting "comb site
+// N" means faulting EVERY copy carrying that id, modelling a forgotten guard on
+// all uses of one RTL gate.
 // ---------------------------------------------------------------------------
 
-static Operation *findCombOpById(ModuleOp module, int64_t targetId) {
-  int64_t counter = 1;
-  Operation *found = nullptr;
+// Collect every comb.and/comb.or whose `trace.comb_site_id` equals targetId.
+static void findCombOpsBySiteId(ModuleOp module, int64_t targetId,
+                                SmallVectorImpl<Operation *> &out) {
   module.walk([&](Operation *op) {
-    if (found)
+    if (!isa<comb::AndOp, comb::OrOp>(op))
       return;
-    if (isa<comb::AndOp, comb::OrOp>(op)) {
-      if (counter == targetId)
-        found = op;
-      counter++;
-    }
+    if (auto a = op->getAttrOfType<IntegerAttr>("trace.comb_site_id"))
+      if (a.getInt() == targetId)
+        out.push_back(op);
   });
-  return found;
+}
+
+// Replace operand `operand` of an AND/OR gate with the gate's identity constant
+// (all-ones for AND, zero for OR), permanently removing it.  Returns failure
+// (after emitting an error) if the operand is out of range or non-integer.
+static LogicalResult faultCombOp(Operation *targetOp, int operand,
+                                 int64_t idForMsg) {
+  unsigned numOperands = targetOp->getNumOperands();
+  if ((unsigned)operand >= numOperands) {
+    targetOp->emitError("InjectFault: comb_operand=")
+        << operand << " is out of range for op with " << numOperands
+        << " operands (comb_site_id=" << idForMsg << ")";
+    return failure();
+  }
+  auto itype = dyn_cast<IntegerType>(targetOp->getOperand(operand).getType());
+  if (!itype) {
+    targetOp->emitError("InjectFault: comb_site_id=")
+        << idForMsg << " operand " << operand
+        << " is not an IntegerType — cannot inject guard_removal";
+    return failure();
+  }
+  const bool isAnd = isa<comb::AndOp>(targetOp);
+  unsigned width = itype.getWidth();
+  APInt identVal = isAnd ? APInt::getAllOnes(width) : APInt(width, 0);
+  OpBuilder b(targetOp);
+  Value identConst = arith::ConstantOp::create(
+      b, targetOp->getLoc(), b.getIntegerAttr(itype, identVal));
+  targetOp->setOperand(operand, identConst);
+  return success();
 }
 
 // ---------------------------------------------------------------------------
@@ -115,14 +151,10 @@ static Operation *findCombOpById(ModuleOp module, int64_t targetId) {
 
 void InjectFaultPass::runOnOperation() {
   const bool doBitFlip = opts.faultWriteSiteId > 0;
-  const bool doGuardRemoval = opts.faultCombSiteId > 0;
-
-  if (!doBitFlip && !doGuardRemoval)
-    return;
 
   ModuleOp module = getOperation();
 
-  if (doBitFlip && doGuardRemoval) {
+  if (doBitFlip && opts.faultCombSiteId > 0) {
     module.emitError("InjectFault: faultWriteSiteId and faultCombSiteId are "
                      "mutually exclusive — set exactly one");
     signalPassFailure();
@@ -173,46 +205,55 @@ void InjectFaultPass::runOnOperation() {
   }
 
   // ------------------------------------------------------------------------
-  // Guard-removal: replace one operand of a comb.and / comb.or with the
-  // gate's identity constant, permanently removing that operand's influence.
-  //   AND identity: all-ones  (AND(all-ones, b...) == AND(b...))
-  //   OR  identity: zero      (OR(zero,      b...) == OR(b...))
+  // Guard-removal (source-anchored).  Replace one operand of a comb.and /
+  // comb.or with the gate's identity constant (all-ones for AND, zero for OR),
+  // permanently removing that operand's influence.  Target selection has two
+  // modes:
+  //   (a) opts.faultCombSiteId > 0 (e.g. arcilator --fault-comb-site-id): fault
+  //       EVERY comb gate tagged trace.comb_site_id == faultCombSiteId, operand
+  //       = faultCombOperand.  A single source gate inlined into K copies is
+  //       faulted on all K (one wrong RTL line affects all its uses).
+  //   (b) opts.faultCombSiteId == 0 (circt-opt --arc-inject-fault, no options):
+  //       fault every comb gate carrying trace.fault_target = <operand-index>.
+  //       Lets a faulted top.mlir be produced for ExportVerilog without needing
+  //       tablegen Pass::Options on this manually-declared pass.
   // ------------------------------------------------------------------------
-  Operation *targetOp = findCombOpById(module, opts.faultCombSiteId);
-  if (!targetOp) {
-    module.emitError("InjectFault: no comb site found with comb_site_id=")
-        << opts.faultCombSiteId
-        << " (max valid ID = number of comb.and/comb.or ops in the module)";
-    signalPassFailure();
-    return;
+  SmallVector<std::pair<Operation *, int>> targets;
+  if (opts.faultCombSiteId > 0) {
+    SmallVector<Operation *> ops;
+    findCombOpsBySiteId(module, opts.faultCombSiteId, ops);
+    if (ops.empty()) {
+      module.emitError("InjectFault: no comb gate tagged trace.comb_site_id=")
+          << opts.faultCombSiteId
+          << " (was the input run through the comb-site tagging step?)";
+      signalPassFailure();
+      return;
+    }
+    for (auto *op : ops)
+      targets.push_back({op, opts.faultCombOperand});
+  } else {
+    module.walk([&](Operation *op) {
+      if (!isa<comb::AndOp, comb::OrOp>(op))
+        return;
+      if (auto a = op->getAttrOfType<IntegerAttr>("trace.fault_target"))
+        targets.push_back({op, static_cast<int>(a.getInt())});
+    });
+    // Marked mode with nothing marked is a deliberate pass-through no-op.
+    if (targets.empty())
+      return;
   }
 
-  unsigned numOperands = targetOp->getNumOperands();
-  if ((unsigned)opts.faultCombOperand >= numOperands) {
-    module.emitError("InjectFault: comb_operand=")
-        << opts.faultCombOperand << " is out of range for op with "
-        << numOperands << " operands";
-    signalPassFailure();
-    return;
+  for (auto &t : targets) {
+    int64_t idForMsg = opts.faultCombSiteId;
+    if (auto a = t.first->getAttrOfType<IntegerAttr>("trace.comb_site_id"))
+      idForMsg = a.getInt();
+    if (failed(faultCombOp(t.first, t.second, idForMsg))) {
+      signalPassFailure();
+      return;
+    }
   }
+}
 
-  Value targetOperand = targetOp->getOperand(opts.faultCombOperand);
-  auto itype = dyn_cast<IntegerType>(targetOperand.getType());
-  if (!itype) {
-    module.emitError("InjectFault: comb_site_id=")
-        << opts.faultCombSiteId << " operand " << opts.faultCombOperand
-        << " is not an IntegerType — cannot inject guard_removal";
-    signalPassFailure();
-    return;
-  }
-
-  const bool isAnd = isa<comb::AndOp>(targetOp);
-  unsigned width = itype.getWidth();
-  APInt identVal = isAnd ? APInt::getAllOnes(width) : APInt(width, 0);
-
-  OpBuilder b(targetOp);
-  Location loc = targetOp->getLoc();
-  Value identConst = arith::ConstantOp::create(b, loc,
-                                                b.getIntegerAttr(itype, identVal));
-  targetOp->setOperand(opts.faultCombOperand, identConst);
+void circt::arc::registerInjectFaultPass() {
+  ::mlir::PassRegistration<InjectFaultPass>();
 }
