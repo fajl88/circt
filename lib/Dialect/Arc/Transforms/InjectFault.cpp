@@ -28,6 +28,7 @@
 
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -139,8 +140,13 @@ static LogicalResult faultCombOp(Operation *targetOp, int operand,
   unsigned width = itype.getWidth();
   APInt identVal = isAnd ? APInt::getAllOnes(width) : APInt(width, 0);
   OpBuilder b(targetOp);
-  Value identConst = arith::ConstantOp::create(
-      b, targetOp->getLoc(), b.getIntegerAttr(itype, identVal));
+  // hw.constant (not arith.constant): the faulted module is lowered by BOTH
+  // arcilator (sim) and firtool/ExportVerilog (formal miter). firtool's --verilog
+  // pipeline does not load the arith dialect, so an arith.constant left here makes
+  // ExportVerilog fail ("Dialect `arith' not found"). hw.constant is native to the
+  // HW/Comb level and lowers cleanly on both paths.
+  Value identConst =
+      hw::ConstantOp::create(b, targetOp->getLoc(), identVal);
   targetOp->setOperand(operand, identConst);
   return success();
 }
