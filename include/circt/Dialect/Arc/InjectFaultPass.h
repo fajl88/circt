@@ -37,5 +37,13 @@ createInjectFaultPass(InjectFaultPassOptions opts = {});
 /// tablegen Pass::Options on a manually-declared pass.
 void registerInjectFaultPass();
 
+/// Register MaterializeCombWires as a circt-opt pass
+/// (`--arc-materialize-comb-wires`).  Wraps every `trace.comb_site_id`-tagged
+/// comb.and/comb.or result in a named, symbol-bearing `hw.wire`
+/// (`__comb_site_<N>`) so the gate survives ExportVerilog as a standalone
+/// Verilog net for the Encarsia miter cut wire, regardless of gate arity.
+/// Run on the firtool/Verilog path only (the arcilator sim path is untouched).
+void registerMaterializeCombWiresPass();
+
 } // namespace arc
 } // namespace circt

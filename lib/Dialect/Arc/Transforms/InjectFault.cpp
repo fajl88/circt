@@ -28,6 +28,8 @@
 
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -36,6 +38,7 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
+#include <string>
 #include <utility>
 
 using namespace circt;
@@ -262,4 +265,73 @@ void InjectFaultPass::runOnOperation() {
 
 void circt::arc::registerInjectFaultPass() {
   ::mlir::PassRegistration<InjectFaultPass>();
+}
+
+// ===========================================================================
+// MaterializeCombWires — make every tagged comb gate a named Verilog cut wire.
+//
+// A guard-removal fault replaces one operand of a comb.and/comb.or with the
+// gate's identity. For a 2-input gate that leaves a single operand, so the gate
+// becomes a pure passthrough that firtool folds away — and the cut wire the
+// Encarsia miter needs (`__comb_site_<N>`) vanishes in the faulted Verilog.
+//
+// This pass wraps each `trace.comb_site_id`-tagged gate's result in an
+// `hw.wire` carrying BOTH a name ("__comb_site_<N>") and an inner symbol
+// (@__comb_site_<N>). The symbol is load-bearing: a name-only hw.wire folds
+// (its name degrades to a hint that can land on the wrong net), whereas a
+// symbol-bearing wire is a hard barrier ExportVerilog must keep — so the named
+// net survives in BOTH top_ref.sv and top_fault.sv regardless of gate arity.
+//
+// Runs ONLY on the firtool/ExportVerilog path (on top_named.mlir, before
+// firtool); the arcilator-fed top_tagged.mlir is untouched, so the simulation
+// path and signal index are unchanged. Supersedes the earlier sv.namehint +
+// wireSpilling approach, which could not preserve folded (2-input) gates.
+// ===========================================================================
+
+namespace {
+class MaterializeCombWiresPass
+    : public PassWrapper<MaterializeCombWiresPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeCombWiresPass)
+
+  StringRef getArgument() const final { return "arc-materialize-comb-wires"; }
+  StringRef getDescription() const final {
+    return "Wrap each trace.comb_site_id-tagged comb.and/comb.or result in a "
+           "named, symbol-bearing hw.wire (__comb_site_<N>) so it survives as a "
+           "standalone Verilog net for the formal miter, independent of arity";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<hw::HWDialect, comb::CombDialect>();
+  }
+  void runOnOperation() override;
+};
+} // namespace
+
+void MaterializeCombWiresPass::runOnOperation() {
+  ModuleOp module = getOperation();
+  // Collect first; we insert ops + reroute uses below, so don't mutate mid-walk.
+  SmallVector<Operation *> gates;
+  module.walk([&](Operation *op) {
+    if (isa<comb::AndOp, comb::OrOp>(op) &&
+        op->hasAttrOfType<IntegerAttr>("trace.comb_site_id"))
+      gates.push_back(op);
+  });
+  for (Operation *op : gates) {
+    int64_t id = op->getAttrOfType<IntegerAttr>("trace.comb_site_id").getInt();
+    Value res = op->getResult(0);
+    OpBuilder b(op);
+    b.setInsertionPointAfter(op);
+    StringAttr nameAttr = b.getStringAttr("__comb_site_" + std::to_string(id));
+    auto wire = hw::WireOp::create(b, op->getLoc(), res, nameAttr,
+                                   hw::InnerSymAttr::get(nameAttr));
+    // Reroute every other reader through the wire (the wire itself still reads
+    // the gate result).
+    res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
+  }
+  llvm::errs() << "[materialize-comb-wires] wrapped " << gates.size()
+               << " tagged comb gates in named hw.wire (__comb_site_<N>)\n";
+}
+
+void circt::arc::registerMaterializeCombWiresPass() {
+  ::mlir::PassRegistration<MaterializeCombWiresPass>();
 }

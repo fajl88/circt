@@ -90,6 +90,7 @@ int main(int argc, char **argv) {
   // the static registration is not dropped by the linker.  Used by the
   // formal-verification flow to produce a faulted top.mlir for ExportVerilog.
   circt::arc::registerInjectFaultPass();
+  circt::arc::registerMaterializeCombWiresPass();
 
   return mlir::failed(mlir::MlirOptMain(
       argc, argv, "CIRCT modular optimizer driver", registry));
