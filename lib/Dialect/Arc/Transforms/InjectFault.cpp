@@ -328,8 +328,23 @@ void MaterializeCombWiresPass::runOnOperation() {
     // the gate result).
     res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
   }
+  // Strip ALL trace.* attrs once the wires carry the ids. This is load-bearing
+  // for CORRECTNESS, not cosmetic: ExportVerilog's PrepareForEmission refuses
+  // to binarize a variadic comb op carrying an attr from an unregistered
+  // dialect ("trace" is not a dialect), and the release-built expression
+  // printer then silently emits only the FIRST TWO operands of a >=3-operand
+  // variadic op (its numOperands==2 assert is compiled out) — miscompiling the
+  // exported Verilog. This pass is the last trace-aware step on the firtool
+  // path (run AFTER mark/inject), so it sweeps every op.
+  int64_t stripped = 0;
+  module.walk([&](Operation *op) {
+    for (StringRef name : {"trace.comb_site_id", "trace.fault_target"})
+      if (op->removeAttr(name))
+        ++stripped;
+  });
   llvm::errs() << "[materialize-comb-wires] wrapped " << gates.size()
-               << " tagged comb gates in named hw.wire (__comb_site_<N>)\n";
+               << " tagged comb gates in named hw.wire (__comb_site_<N>), "
+               << "stripped " << stripped << " trace.* attrs\n";
 }
 
 void circt::arc::registerMaterializeCombWiresPass() {
