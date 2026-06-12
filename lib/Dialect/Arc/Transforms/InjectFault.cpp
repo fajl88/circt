@@ -37,6 +37,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include <string>
 #include <utility>
@@ -155,6 +156,139 @@ static LogicalResult faultCombOp(Operation *targetOp, int operand,
 }
 
 // ---------------------------------------------------------------------------
+// Switchable mode (NEXT_STEPS #6, coord/contracts/switchable_fault.md).
+//
+// Make EVERY trace.comb_site_id-tagged gate operand runtime-switchable:
+//
+//   %en   = arc.state_read %__fault_en_<site>_<k> : i8     (fault-class byte)
+//   %on   = comb.icmp eq %en, 1                            (1 = guard removal)
+//   %op'  = comb.mux %on, <identity>, %operand
+//
+// The i8 enable states are allocated in the enclosing arc.model body (this
+// pass runs BEFORE state allocation, so AllocateState assigns them offsets and
+// ModelInfo exports them to model_state.json by name, where the driver
+// resolves and pokes them). EmitCausality already ran, so the instrumentation
+// recorded the ORIGINAL dataflow against unchanged signal/write-site ids —
+// with all enables 0 the muxes pass the original operands through and the
+// model computes bit-identical values. The class byte compares against 1
+// specifically (not != 0) so future fault classes (NEXT_STEPS #6b) get their
+// own selects instead of aliasing onto guard removal.
+//
+// Clones: all inlined copies of one source gate share the same (site, k)
+// enable state — switching a site faults every clone, exactly like the baked
+// guard-removal mode.
+// ---------------------------------------------------------------------------
+
+static LogicalResult runSwitchable(ModuleOp module) {
+  // Tagged gates must all live inside an arc.model body — that is where the
+  // storage block argument for the enable states lives. A tagged gate outside
+  // any model could not be switched and would silently diverge from the baked
+  // mode, so it is a hard error.
+  DenseMap<ModelOp, SmallVector<Operation *>> gatesByModel;
+  int64_t taggedTotal = 0;
+  WalkResult walkRes = module.walk([&](Operation *op) -> WalkResult {
+    if (!isa<comb::AndOp, comb::OrOp>(op) ||
+        !op->hasAttrOfType<IntegerAttr>("trace.comb_site_id"))
+      return WalkResult::advance();
+    ++taggedTotal;
+    auto model = op->getParentOfType<ModelOp>();
+    if (!model) {
+      op->emitError("InjectFault(switchable): tagged comb gate (comb_site_id=")
+          << op->getAttrOfType<IntegerAttr>("trace.comb_site_id").getInt()
+          << ") is not inside an arc.model — cannot allocate its enable state";
+      return WalkResult::interrupt();
+    }
+    gatesByModel[model].push_back(op);
+    return WalkResult::advance();
+  });
+  if (walkRes.wasInterrupted())
+    return failure();
+
+  if (taggedTotal == 0) {
+    module.emitError(
+        "InjectFault(switchable): no trace.comb_site_id-tagged comb gates "
+        "found (was the input run through the comb-site tagging step?)");
+    return failure();
+  }
+
+  int64_t numEnableStates = 0, numMuxedOperands = 0;
+  for (auto &[model, gates] : gatesByModel) {
+    Block &body = model.getBodyBlock();
+    if (body.getNumArguments() < 1) {
+      model.emitError("InjectFault(switchable): arc.model body has no storage "
+                      "block argument");
+      return failure();
+    }
+    Value storage = body.getArgument(0);
+
+    OpBuilder allocBuilder(model.getContext());
+    allocBuilder.setInsertionPointToStart(&body);
+    auto i8Ty = allocBuilder.getIntegerType(8);
+
+    // One enable state per (site, operand); clones share it. Arity must agree
+    // across clones of one site (clones are copies of one source gate).
+    DenseMap<std::pair<int64_t, int64_t>, Value> enableState;
+    DenseMap<int64_t, unsigned> arityBySite;
+
+    for (Operation *gate : gates) {
+      int64_t siteId =
+          gate->getAttrOfType<IntegerAttr>("trace.comb_site_id").getInt();
+      unsigned numOperands = gate->getNumOperands();
+      auto [it, first] = arityBySite.try_emplace(siteId, numOperands);
+      if (!first && it->second != numOperands) {
+        gate->emitError("InjectFault(switchable): clones of comb_site_id=")
+            << siteId << " disagree on operand count (" << it->second
+            << " vs " << numOperands << ") — refusing to switch inconsistently";
+        return failure();
+      }
+
+      const bool isAnd = isa<comb::AndOp>(gate);
+      OpBuilder b(gate);
+      Location loc = gate->getLoc();
+      for (unsigned k = 0; k < numOperands; ++k) {
+        auto key = std::make_pair(siteId, (int64_t)k);
+        Value &state = enableState[key];
+        if (!state) {
+          auto alloc = AllocStateOp::create(allocBuilder, model.getLoc(),
+                                            StateType::get(i8Ty), storage);
+          alloc->setAttr("name",
+                         allocBuilder.getStringAttr(
+                             "__fault_en_" + std::to_string(siteId) + "_" +
+                             std::to_string(k)));
+          state = alloc;
+          ++numEnableStates;
+        }
+
+        auto itype = dyn_cast<IntegerType>(gate->getOperand(k).getType());
+        if (!itype) {
+          gate->emitError("InjectFault(switchable): comb_site_id=")
+              << siteId << " operand " << k << " is not an IntegerType";
+          return failure();
+        }
+        unsigned width = itype.getWidth();
+        APInt identVal = isAnd ? APInt::getAllOnes(width) : APInt(width, 0);
+
+        Value en = StateReadOp::create(b, loc, state);
+        Value clsGuardRemoval = hw::ConstantOp::create(b, loc, APInt(8, 1));
+        Value on = comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, en,
+                                        clsGuardRemoval);
+        Value ident = hw::ConstantOp::create(b, loc, identVal);
+        Value switched =
+            comb::MuxOp::create(b, loc, on, ident, gate->getOperand(k));
+        gate->setOperand(k, switched);
+        ++numMuxedOperands;
+      }
+    }
+  }
+
+  llvm::errs() << "[inject-fault] switchable: " << taggedTotal
+               << " tagged gate clones, " << numEnableStates
+               << " __fault_en_<site>_<operand> states, " << numMuxedOperands
+               << " operands muxed\n";
+  return success();
+}
+
+// ---------------------------------------------------------------------------
 // runOnOperation
 // ---------------------------------------------------------------------------
 
@@ -167,6 +301,18 @@ void InjectFaultPass::runOnOperation() {
     module.emitError("InjectFault: faultWriteSiteId and faultCombSiteId are "
                      "mutually exclusive — set exactly one");
     signalPassFailure();
+    return;
+  }
+
+  if (opts.faultSwitchable) {
+    if (doBitFlip || opts.faultCombSiteId > 0) {
+      module.emitError("InjectFault: faultSwitchable is mutually exclusive "
+                       "with the baked faultWriteSiteId/faultCombSiteId modes");
+      signalPassFailure();
+      return;
+    }
+    if (failed(runSwitchable(module)))
+      signalPassFailure();
     return;
   }
 

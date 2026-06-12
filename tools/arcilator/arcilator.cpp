@@ -170,6 +170,15 @@ static llvm::cl::opt<int>
                                     "identity constant (guard-removal only)"),
                      llvm::cl::init(0), llvm::cl::cat(mainCategory));
 
+static llvm::cl::opt<bool> faultSwitchable(
+    "fault-switchable",
+    llvm::cl::desc(
+        "Make every trace.comb_site_id-tagged gate operand runtime-switchable "
+        "via __fault_en_<site>_<operand> i8 model states (compile once, "
+        "select faults per run; mutually exclusive with --fault-comb-site-id/"
+        "--fault-write-site-id)"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
                                         llvm::cl::init(true),
                                         llvm::cl::cat(mainCategory));
@@ -429,10 +438,13 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
 
   // Inject fault immediately after causality instrumentation so that
   // EmitCausality records the original (pre-fault) data flow, while
-  // the state write receives the flipped value.
-  if (faultWriteSiteId > 0 || faultCombSiteId > 0)
-    pm.addPass(arc::createInjectFaultPass(
-        {faultWriteSiteId, faultBit, faultCombSiteId, faultCombOperand}));
+  // the state write receives the flipped value. The switchable mode runs in
+  // the same slot (before state allocation, so its __fault_en states get
+  // storage and model_state.json entries).
+  if (faultWriteSiteId > 0 || faultCombSiteId > 0 || faultSwitchable)
+    pm.addPass(arc::createInjectFaultPass({faultWriteSiteId, faultBit,
+                                           faultCombSiteId, faultCombOperand,
+                                           faultSwitchable}));
 
   // Allocate states.
   if (untilReached(UntilStateAlloc))

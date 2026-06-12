@@ -19,6 +19,14 @@ struct InjectFaultPassOptions {
   int faultBit = 0;         // bit position to flip (bit-flip only)
   int faultCombSiteId = 0;  // comb site ID for guard-removal injection (0 = disabled)
   int faultCombOperand = 0; // operand index to replace with identity (guard-removal only)
+  // Runtime-switchable faults (NEXT_STEPS #6, coord/contracts/switchable_fault.md):
+  // instead of baking ONE fault, make EVERY trace.comb_site_id-tagged gate
+  // operand switchable at runtime. Each (site, operand) gets an i8 model state
+  // `__fault_en_<site>_<operand>` (a fault-CLASS byte: 0 = off, 1 = guard
+  // removal; further classes reserved for NEXT_STEPS #6b) and the operand is
+  // rewritten to `mux(class == 1, identity, operand)`. Mutually exclusive with
+  // the baked modes above.
+  bool faultSwitchable = false;
 };
 
 /// Create an InjectFaultPass instance.
