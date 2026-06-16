@@ -152,8 +152,11 @@ private:
   // comb.and / comb.or Operation* → 1-indexed comb site ID
   DenseMap<Operation *, int64_t> combOpToSiteId;
 
+  // relational comb.icmp Operation* → 1-indexed cmp site ID (NEXT_STEPS #5)
+  DenseMap<Operation *, int64_t> cmpOpToSiteId;
+
   // External function declarations added to the module
-  func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl;
+  func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl, addCmpPredDecl;
 
   // -----------------------------------------------------------------------
   // Memoized recorder functions.
@@ -188,6 +191,7 @@ private:
   void enumSignals();
   void enumWriteSites();
   void enumCombSites();
+  void enumCmpSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
@@ -198,6 +202,8 @@ private:
                    int8_t delta);
   void emitAddCombPred(OpBuilder &b, Location loc, int64_t siteId,
                        int64_t operand, Value isIdentityI8);
+  void emitAddCmpPred(OpBuilder &b, Location loc, int64_t siteId,
+                      int64_t predicate, Value boundaryI8);
   void emitCommit(OpBuilder &b, Location loc);
 
   Value toI64(OpBuilder &b, Location loc, Value val);
@@ -241,6 +247,7 @@ void EmitCausalityPass::runOnOperation() {
 
   enumSignals();
   enumCombSites();
+  enumCmpSites();
   enumWriteSites();
   writeSignalIndex();
   declareRuntimeFuncs();
@@ -313,6 +320,20 @@ void EmitCausalityPass::enumCombSites() {
       return;
     if (auto a = op->getAttrOfType<IntegerAttr>("trace.comb_site_id"))
       combOpToSiteId[op] = a.getInt();
+  });
+}
+
+void EmitCausalityPass::enumCmpSites() {
+  // Source-anchored cmp-site IDs (NEXT_STEPS #5): each relational comb.icmp carries
+  // a stable `trace.cmp_site_id` stamped at top.mlir (tools/tag_comb_sites.py tag-cmp)
+  // before arc lowering. We READ it — a SEPARATE id space from comb_site_id — so the id
+  // names the same SOURCE icmp in the trace, the simulated fault, and the Verilog miter
+  // (inlined clones inherit the id). Untagged icmps (synthesized, or eq/ne) get no id.
+  module.walk([&](Operation *op) {
+    if (!isa<comb::ICmpOp>(op))
+      return;
+    if (auto a = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id"))
+      cmpOpToSiteId[op] = a.getInt();
   });
 }
 
@@ -393,6 +414,26 @@ void EmitCausalityPass::writeSignalIndex() {
   });
   root["comb_sites"] = llvm::json::Value(std::move(combSites));
 
+  // Cmp site table (NEXT_STEPS #5): one entry per SOURCE relational comb.icmp (keyed by
+  // trace.cmp_site_id; first inlined clone seen). Untagged icmps (id 0) are skipped.
+  llvm::json::Array cmpSites;
+  llvm::DenseSet<int64_t> seenCmpIds;
+  module.walk([&](Operation *op) {
+    auto icmp = dyn_cast<comb::ICmpOp>(op);
+    if (!icmp)
+      return;
+    int64_t csid = cmpOpToSiteId.lookup(op);
+    if (csid == 0)
+      return;
+    if (!seenCmpIds.insert(csid).second)
+      return;
+    llvm::json::Object e;
+    e["cmp_site_id"] = csid;
+    e["predicate"] = static_cast<int64_t>(icmp.getPredicate());
+    cmpSites.push_back(llvm::json::Value(std::move(e)));
+  });
+  root["cmp_sites"] = llvm::json::Value(std::move(cmpSites));
+
   std::string outPath = opts.causalityDir + "/__signal_index.json";
   std::error_code ec;
   llvm::raw_fd_ostream os(outPath, ec, llvm::sys::fs::OF_None);
@@ -433,6 +474,8 @@ void EmitCausalityPass::declareRuntimeFuncs() {
       getOrDeclare("causality_commit", FunctionType::get(ctx, {}, {}));
   addCombPredDecl = getOrDeclare("causality_add_comb_pred",
                                   FunctionType::get(ctx, {i64, i64, i8}, {}));
+  addCmpPredDecl = getOrDeclare("causality_add_cmp_pred",
+                                 FunctionType::get(ctx, {i64, i64, i8}, {}));
 }
 
 // =======================================================================
@@ -741,6 +784,71 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
   }
 
   // -----------------------------------------------------------------------
+  // Relational comb.icmp with a source-anchored trace.cmp_site_id (NEXT_STEPS #5):
+  // record the off-by-one trigger boundary = (lhs == rhs) for this site, embed the
+  // predicate (so the fault's off-by-one partner is determined), then recurse both
+  // operands. No extra guard — path-sensitivity is inherited from the consumer (the
+  // call to this recorder is already under whatever conditions reach the icmp result).
+  // Untagged icmps (synthesized, or excluded eq/ne) fall through to the generic walk.
+  // -----------------------------------------------------------------------
+  if (auto icmp = dyn_cast<comb::ICmpOp>(defOp)) {
+    int64_t siteId = cmpOpToSiteId.lookup(defOp);
+    if (siteId != 0) {
+      OperandRange operands = defOp->getOperands(); // {lhs, rhs}
+      int64_t predCode = static_cast<int64_t>(icmp.getPredicate());
+
+      SmallVector<RecorderInfo> operandInfos;
+      for (auto operand : operands)
+        operandInfos.push_back(getOrEmitRecorder(operand));
+
+      llvm::SetVector<Value> liveInSet;
+      for (auto operand : operands)
+        liveInSet.insert(operand); // lhs, rhs needed for the boundary compare
+      for (auto &oi : operandInfos)
+        for (auto v : oi.liveIns)
+          liveInSet.insert(v);
+      SmallVector<Value> liveIns(liveInSet.begin(), liveInSet.end());
+
+      SmallVector<Type> argTypes;
+      for (auto v : liveIns) argTypes.push_back(v.getType());
+      auto funcType = FunctionType::get(ctx, argTypes, {});
+
+      OpBuilder modBuilder(ctx);
+      modBuilder.setInsertionPointToEnd(module.getBody());
+      std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+      auto recFunc = modBuilder.create<func::FuncOp>(loc, recName, funcType);
+      recFunc.setVisibility(SymbolTable::Visibility::Private);
+
+      RecorderInfo info{recFunc, liveIns};
+      recorderCache[val] = info;
+
+      Block *body = recFunc.addEntryBlock();
+      OpBuilder bodyBuilder(body, body->end());
+
+      DenseMap<Value, Value> argMap;
+      for (auto [modelVal, blockArg] :
+           llvm::zip(liveIns, body->getArguments()))
+        argMap[modelVal] = blockArg;
+
+      // boundary = (lhs == rhs) as i8 (the only inputs where strict and non-strict
+      // predicates disagree — the off-by-one trigger; analog of computeIsIdentity).
+      Value lhs = argMap[operands[0]];
+      Value rhs = argMap[operands[1]];
+      Value cmpEq = bodyBuilder.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, lhs, rhs);
+      Value boundary =
+          bodyBuilder.create<arith::ExtUIOp>(loc, bodyBuilder.getI8Type(), cmpEq);
+      emitAddCmpPred(bodyBuilder, loc, siteId, predCode, boundary);
+
+      for (unsigned i = 0; i < operands.size(); ++i)
+        emitRecorderCall(bodyBuilder, loc, operandInfos[i], argMap);
+
+      bodyBuilder.create<func::ReturnOp>(loc);
+      return info;
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // Generic combinational op: no runtime guards, just recurse all operands.
   // Live-ins: union of child live-ins only (operands not needed directly).
   // -----------------------------------------------------------------------
@@ -834,6 +942,14 @@ void EmitCausalityPass::emitAddCombPred(OpBuilder &b, Location loc,
   b.create<func::CallOp>(
       loc, addCombPredDecl,
       ValueRange{cI64(b, loc, siteId), cI64(b, loc, operand), isIdentityI8});
+}
+
+void EmitCausalityPass::emitAddCmpPred(OpBuilder &b, Location loc,
+                                        int64_t siteId, int64_t predicate,
+                                        Value boundaryI8) {
+  b.create<func::CallOp>(
+      loc, addCmpPredDecl,
+      ValueRange{cI64(b, loc, siteId), cI64(b, loc, predicate), boundaryI8});
 }
 
 void EmitCausalityPass::emitCommit(OpBuilder &b, Location loc) {

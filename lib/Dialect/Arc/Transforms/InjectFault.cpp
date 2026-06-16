@@ -155,6 +155,42 @@ static LogicalResult faultCombOp(Operation *targetOp, int operand,
   return success();
 }
 
+// The off-by-one involution on relational predicates (NEXT_STEPS #5): the only
+// mutation whose disagreement set is exactly {lhs == rhs}. eq/ne map to themselves
+// (excluded — not relational; their off-by-one partner is the complement).
+static comb::ICmpPredicate offByOnePartner(comb::ICmpPredicate p) {
+  using P = comb::ICmpPredicate;
+  switch (p) {
+  case P::slt: return P::sle;  case P::sle: return P::slt;
+  case P::sgt: return P::sge;  case P::sge: return P::sgt;
+  case P::ult: return P::ule;  case P::ule: return P::ult;
+  case P::ugt: return P::uge;  case P::uge: return P::ugt;
+  default:     return p;
+  }
+}
+
+// Baked off-by-one mutation: flip a marked relational comb.icmp's predicate to its
+// off-by-one partner in place (the result naturally reflects the new predicate).
+// Used on the firtool/ExportVerilog (miter) path, analogous to faultCombOp.
+static LogicalResult faultCmpOp(Operation *targetOp, int64_t idForMsg) {
+  auto icmp = dyn_cast<comb::ICmpOp>(targetOp);
+  if (!icmp) {
+    targetOp->emitError("InjectFault: cmp_site_id=")
+        << idForMsg << " marked op is not a comb.icmp";
+    return failure();
+  }
+  comb::ICmpPredicate p = icmp.getPredicate();
+  comb::ICmpPredicate partner = offByOnePartner(p);
+  if (partner == p) {
+    targetOp->emitError("InjectFault: cmp_site_id=")
+        << idForMsg << " predicate is not relational (no off-by-one partner; "
+        << "eq/ne are excluded)";
+    return failure();
+  }
+  icmp.setPredicate(partner);
+  return success();
+}
+
 // ---------------------------------------------------------------------------
 // Switchable mode (NEXT_STEPS #6, coord/contracts/switchable_fault.md).
 //
@@ -185,29 +221,46 @@ static LogicalResult runSwitchable(ModuleOp module) {
   // any model could not be switched and would silently diverge from the baked
   // mode, so it is a hard error.
   DenseMap<ModelOp, SmallVector<Operation *>> gatesByModel;
-  int64_t taggedTotal = 0;
+  DenseMap<ModelOp, SmallVector<Operation *>> cmpsByModel;  // NEXT_STEPS #5
+  int64_t taggedTotal = 0, taggedCmpTotal = 0;
   WalkResult walkRes = module.walk([&](Operation *op) -> WalkResult {
-    if (!isa<comb::AndOp, comb::OrOp>(op) ||
-        !op->hasAttrOfType<IntegerAttr>("trace.comb_site_id"))
+    // comb.and / comb.or guard-removal sites
+    if (isa<comb::AndOp, comb::OrOp>(op) &&
+        op->hasAttrOfType<IntegerAttr>("trace.comb_site_id")) {
+      ++taggedTotal;
+      auto model = op->getParentOfType<ModelOp>();
+      if (!model) {
+        op->emitError("InjectFault(switchable): tagged comb gate (comb_site_id=")
+            << op->getAttrOfType<IntegerAttr>("trace.comb_site_id").getInt()
+            << ") is not inside an arc.model — cannot allocate its enable state";
+        return WalkResult::interrupt();
+      }
+      gatesByModel[model].push_back(op);
       return WalkResult::advance();
-    ++taggedTotal;
-    auto model = op->getParentOfType<ModelOp>();
-    if (!model) {
-      op->emitError("InjectFault(switchable): tagged comb gate (comb_site_id=")
-          << op->getAttrOfType<IntegerAttr>("trace.comb_site_id").getInt()
-          << ") is not inside an arc.model — cannot allocate its enable state";
-      return WalkResult::interrupt();
     }
-    gatesByModel[model].push_back(op);
+    // relational comb.icmp off-by-one sites
+    if (isa<comb::ICmpOp>(op) &&
+        op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id")) {
+      ++taggedCmpTotal;
+      auto model = op->getParentOfType<ModelOp>();
+      if (!model) {
+        op->emitError("InjectFault(switchable): tagged comb.icmp (cmp_site_id=")
+            << op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt()
+            << ") is not inside an arc.model — cannot allocate its enable state";
+        return WalkResult::interrupt();
+      }
+      cmpsByModel[model].push_back(op);
+      return WalkResult::advance();
+    }
     return WalkResult::advance();
   });
   if (walkRes.wasInterrupted())
     return failure();
 
-  if (taggedTotal == 0) {
+  if (taggedTotal == 0 && taggedCmpTotal == 0) {
     module.emitError(
-        "InjectFault(switchable): no trace.comb_site_id-tagged comb gates "
-        "found (was the input run through the comb-site tagging step?)");
+        "InjectFault(switchable): no trace.comb_site_id / trace.cmp_site_id-tagged "
+        "ops found (was the input run through the comb-site tagging step?)");
     return failure();
   }
 
@@ -281,10 +334,66 @@ static LogicalResult runSwitchable(ModuleOp module) {
     }
   }
 
+  // Comparison off-by-one sites (NEXT_STEPS #5): mux the icmp RESULT between the
+  // original and its off-by-one partner predicate, selected by the class byte en == 2.
+  // Per-site (clones share __fault_en_cmp_<N>); disabled (en != 2) passes the original
+  // through, bit-identical to reference.
+  int64_t numCmpEnableStates = 0, numMuxedCmps = 0;
+  for (auto &[model, cmps] : cmpsByModel) {
+    Block &body = model.getBodyBlock();
+    if (body.getNumArguments() < 1) {
+      model.emitError("InjectFault(switchable): arc.model body has no storage "
+                      "block argument");
+      return failure();
+    }
+    Value storage = body.getArgument(0);
+    OpBuilder allocBuilder(model.getContext());
+    allocBuilder.setInsertionPointToStart(&body);
+    auto i8Ty = allocBuilder.getIntegerType(8);
+
+    DenseMap<int64_t, Value> cmpEnableState; // per cmp_site_id; clones share
+    for (Operation *op : cmps) {
+      auto icmp = cast<comb::ICmpOp>(op);
+      int64_t siteId =
+          op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
+      comb::ICmpPredicate partner = offByOnePartner(icmp.getPredicate());
+      if (partner == icmp.getPredicate()) {
+        op->emitError("InjectFault(switchable): cmp_site_id=")
+            << siteId << " predicate is not relational (no off-by-one partner)";
+        return failure();
+      }
+
+      Value &state = cmpEnableState[siteId];
+      if (!state) {
+        auto alloc = AllocStateOp::create(allocBuilder, model.getLoc(),
+                                          StateType::get(i8Ty), storage);
+        alloc->setAttr("name", allocBuilder.getStringAttr(
+                                   "__fault_en_cmp_" + std::to_string(siteId)));
+        state = alloc;
+        ++numCmpEnableStates;
+      }
+
+      OpBuilder b(op);
+      b.setInsertionPointAfter(op);
+      Location loc = op->getLoc();
+      Value origResult = icmp.getResult();
+      Value mutated =
+          comb::ICmpOp::create(b, loc, partner, icmp.getLhs(), icmp.getRhs());
+      Value en = StateReadOp::create(b, loc, state);
+      Value cls2 = hw::ConstantOp::create(b, loc, APInt(8, 2));
+      Value on = comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, en, cls2);
+      Value muxed = comb::MuxOp::create(b, loc, on, mutated, origResult);
+      origResult.replaceAllUsesExcept(muxed, muxed.getDefiningOp());
+      ++numMuxedCmps;
+    }
+  }
+
   llvm::errs() << "[inject-fault] switchable: " << taggedTotal
                << " tagged gate clones, " << numEnableStates
                << " __fault_en_<site>_<operand> states, " << numMuxedOperands
-               << " operands muxed\n";
+               << " operands muxed; " << taggedCmpTotal << " tagged icmp clones, "
+               << numCmpEnableStates << " __fault_en_cmp_<site> states, "
+               << numMuxedCmps << " icmp results muxed\n";
   return success();
 }
 
@@ -387,15 +496,27 @@ void InjectFaultPass::runOnOperation() {
     for (auto *op : ops)
       targets.push_back({op, opts.faultCombOperand});
   } else {
+    SmallVector<Operation *> cmpMarked;
     module.walk([&](Operation *op) {
-      if (!isa<comb::AndOp, comb::OrOp>(op))
-        return;
-      if (auto a = op->getAttrOfType<IntegerAttr>("trace.fault_target"))
-        targets.push_back({op, static_cast<int>(a.getInt())});
+      if (isa<comb::AndOp, comb::OrOp>(op)) {
+        if (auto a = op->getAttrOfType<IntegerAttr>("trace.fault_target"))
+          targets.push_back({op, static_cast<int>(a.getInt())});
+      } else if (isa<comb::ICmpOp>(op) &&
+                 op->hasAttrOfType<IntegerAttr>("trace.fault_target") &&
+                 op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id")) {
+        cmpMarked.push_back(op); // off-by-one baked mutation (NEXT_STEPS #5)
+      }
     });
     // Marked mode with nothing marked is a deliberate pass-through no-op.
-    if (targets.empty())
+    if (targets.empty() && cmpMarked.empty())
       return;
+    for (Operation *op : cmpMarked) {
+      int64_t id = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
+      if (failed(faultCmpOp(op, id))) {
+        signalPassFailure();
+        return;
+      }
+    }
   }
 
   for (auto &t : targets) {
@@ -474,6 +595,24 @@ void MaterializeCombWiresPass::runOnOperation() {
     // the gate result).
     res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
   }
+  // Cmp cut wires (NEXT_STEPS #5): same symbol-bearing hw.wire scheme for tagged
+  // relational comb.icmp results, so __cmp_site_<N> survives in ref + fault Verilog.
+  SmallVector<Operation *> cmps;
+  module.walk([&](Operation *op) {
+    if (isa<comb::ICmpOp>(op) &&
+        op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id"))
+      cmps.push_back(op);
+  });
+  for (Operation *op : cmps) {
+    int64_t id = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
+    Value res = op->getResult(0);
+    OpBuilder b(op);
+    b.setInsertionPointAfter(op);
+    StringAttr nameAttr = b.getStringAttr("__cmp_site_" + std::to_string(id));
+    auto wire = hw::WireOp::create(b, op->getLoc(), res, nameAttr,
+                                   hw::InnerSymAttr::get(nameAttr));
+    res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
+  }
   // Strip ALL trace.* attrs once the wires carry the ids. This is load-bearing
   // for CORRECTNESS, not cosmetic: ExportVerilog's PrepareForEmission refuses
   // to binarize a variadic comb op carrying an attr from an unregistered
@@ -484,7 +623,8 @@ void MaterializeCombWiresPass::runOnOperation() {
   // path (run AFTER mark/inject), so it sweeps every op.
   int64_t stripped = 0;
   module.walk([&](Operation *op) {
-    for (StringRef name : {"trace.comb_site_id", "trace.fault_target"})
+    for (StringRef name :
+         {"trace.comb_site_id", "trace.cmp_site_id", "trace.fault_target"})
       if (op->removeAttr(name))
         ++stripped;
   });
