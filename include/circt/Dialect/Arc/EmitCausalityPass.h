@@ -19,6 +19,12 @@ namespace arc {
 struct EmitCausalityPassOptions {
   std::string causalityDir; // output dir for __signal_index.json
   std::string sinkNames;    // comma-separated observable signal names
+  // NEXT_STEPS #12: comma-separated memory NAME tokens to instrument as
+  // first-class, sliceable cells (cell_sink_id = mem_base + address). Empty =
+  // OFF, in which case __signal_index.json + traces are byte-identical to the
+  // register-only behaviour. A token matches a memory if it is a substring of
+  // the memory's name attribute.
+  std::string memoryNames;
 };
 
 /// Create an EmitCausalityPass instance.  If causalityDir is empty the pass

@@ -146,6 +146,14 @@ static llvm::cl::opt<std::string>
                                   "names to instrument for causality tracing"),
                    llvm::cl::init(""), llvm::cl::cat(mainCategory));
 
+// NEXT_STEPS #12: comma-separated memory NAME tokens to instrument as
+// first-class sliceable cells. Empty = off (byte-identical to register-only).
+static llvm::cl::opt<std::string>
+    causalityMemories("causality-memories",
+                      llvm::cl::desc("Comma-separated memory name tokens to "
+                                     "instrument as first-class causality cells"),
+                      llvm::cl::init(""), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<int>
     faultWriteSiteId("fault-write-site-id",
                      llvm::cl::desc("Signal ID (write_site_id) at which to "
@@ -434,7 +442,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // arc.state_write and comb.mux are still in the same flat scope.
   if (!causalityDir.empty())
     pm.addPass(arc::createEmitCausalityPass(
-        {std::string(causalityDir), std::string(causalitySinks)}));
+        {std::string(causalityDir), std::string(causalitySinks),
+         std::string(causalityMemories)}));
 
   // Inject fault immediately after causality instrumentation so that
   // EmitCausality records the original (pre-fault) data flow, while

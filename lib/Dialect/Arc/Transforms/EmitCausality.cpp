@@ -39,6 +39,7 @@
 #include "circt/Dialect/Arc/EmitCausalityPass.h"
 
 #include "circt/Dialect/Arc/ArcOps.h"
+#include "circt/Dialect/Arc/ArcTypes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -103,6 +104,20 @@ static StringRef getStateName(Value state) {
 }
 
 // -----------------------------------------------------------------------
+// Utility: get the "name" attribute of a memory handle's defining op
+// (arc.memory / arc.alloc_memory), or empty. Used to scope + name memory
+// cells (NEXT_STEPS #12).
+// -----------------------------------------------------------------------
+static StringRef getMemoryName(Value mem) {
+  Operation *defOp = mem.getDefiningOp();
+  if (!defOp)
+    return {};
+  if (auto nameAttr = defOp->getAttrOfType<StringAttr>("name"))
+    return nameAttr.getValue();
+  return {};
+}
+
+// -----------------------------------------------------------------------
 // Resolve a Value to a direct arc.state_read storage handle (or null).
 // -----------------------------------------------------------------------
 static Value resolveDirectState(Value val) {
@@ -155,6 +170,22 @@ private:
   // relational comb.icmp Operation* → 1-indexed cmp site ID (NEXT_STEPS #5)
   DenseMap<Operation *, int64_t> cmpOpToSiteId;
 
+  // NEXT_STEPS #12: memory-cell instrumentation. A memory is in scope if its
+  // "name" attr contains any token from --causality-memories. Each in-scope
+  // memory gets a contiguous sink-id range [base, base+depth) allocated ABOVE
+  // the dense register id space (enumMemories). A cell's sink id = base + addr,
+  // computed at runtime, so memory writes/reads reuse the register event +
+  // time-delta machinery (no slicer change). Empty scope => no memory entries
+  // => __signal_index.json + traces byte-identical to register-only.
+  struct MemInfo {
+    int64_t base;
+    int64_t depth;
+    std::string name;
+  };
+  SmallVector<std::string> memScopeTokens;
+  DenseMap<Operation *, MemInfo> memToInfo; // memory defining-op -> info
+  SmallVector<MemInfo> orderedMems;         // deterministic order, for the index
+
   // External function declarations added to the module
   func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl, addCmpPredDecl;
 
@@ -189,12 +220,15 @@ private:
                         const DenseMap<Value, Value> &argMap);
 
   void enumSignals();
+  void enumMemories(); // NEXT_STEPS #12
   void enumWriteSites();
   void enumCombSites();
   void enumCmpSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
+  void injectForMemWrite(OpBuilder &b, MemoryWriteOp writeOp, const MemInfo &mi,
+                         int64_t wsid); // NEXT_STEPS #12
 
   void emitBegin(OpBuilder &b, Location loc, int64_t sinkId, int64_t wsid,
                  Value newVal, int32_t numBits);
@@ -205,6 +239,14 @@ private:
   void emitAddCmpPred(OpBuilder &b, Location loc, int64_t siteId,
                       int64_t predicate, Value boundaryI8);
   void emitCommit(OpBuilder &b, Location loc);
+
+  // NEXT_STEPS #12: dynamic (runtime-Value) sink/pred ids for memory cells.
+  void emitBeginDynamic(OpBuilder &b, Location loc, Value sinkI64, int64_t wsid,
+                        Value newVal, int32_t numBits);
+  void emitAddPredDynamic(OpBuilder &b, Location loc, Value predI64, int8_t role,
+                          int8_t delta);
+  // cell sink id = base + zext(addr), computed in MLIR.
+  Value cellId(OpBuilder &b, Location loc, int64_t base, Value addr);
 
   Value toI64(OpBuilder &b, Location loc, Value val);
   Value cI64(OpBuilder &b, Location loc, int64_t v);
@@ -246,6 +288,7 @@ void EmitCausalityPass::runOnOperation() {
   recorderCounter = 0;
 
   enumSignals();
+  enumMemories(); // #12: must follow enumSignals (allocates above reg watermark)
   enumCombSites();
   enumCmpSites();
   enumWriteSites();
@@ -264,6 +307,21 @@ void EmitCausalityPass::runOnOperation() {
       continue;
     OpBuilder builder(writeOp);
     injectForWrite(builder, writeOp, sinkId);
+  }
+
+  // NEXT_STEPS #12: instrument in-scope memory writes as cell write events.
+  if (!memToInfo.empty()) {
+    SmallVector<MemoryWriteOp> memWrites;
+    module.walk([&](MemoryWriteOp op) { memWrites.push_back(op); });
+    for (auto writeOp : memWrites) {
+      Operation *md = writeOp.getMemory().getDefiningOp();
+      auto it = memToInfo.find(md);
+      if (it == memToInfo.end())
+        continue;
+      int64_t wsid = writeOpToSiteId.lookup(writeOp.getOperation());
+      OpBuilder builder(writeOp);
+      injectForMemWrite(builder, writeOp, it->second, wsid);
+    }
   }
 }
 
@@ -295,6 +353,98 @@ void EmitCausalityPass::enumWriteSites() {
   module.walk([&](StateWriteOp op) {
     writeOpToSiteId[op.getOperation()] = counter++;
   });
+  // #12: in-scope memory writes continue the write-site id space AFTER the
+  // register writes, so register write-site ids are unchanged when off.
+  if (!memToInfo.empty()) {
+    module.walk([&](MemoryWriteOp op) {
+      if (memToInfo.count(op.getMemory().getDefiningOp()))
+        writeOpToSiteId[op.getOperation()] = counter++;
+    });
+  }
+}
+
+// =======================================================================
+// Phase 1d (NEXT_STEPS #12): enumerate in-scope memories; allocate a
+// contiguous sink-id range [base, base+depth) per memory ABOVE the register
+// watermark.  No-op when --causality-memories is empty (byte-identical).
+// =======================================================================
+void EmitCausalityPass::enumMemories() {
+  memScopeTokens.clear();
+  for (StringRef s(opts.memoryNames); !s.empty();) {
+    auto [tok, rest] = s.split(',');
+    tok = tok.trim();
+    if (!tok.empty())
+      memScopeTokens.push_back(tok.str());
+    s = rest;
+  }
+  if (memScopeTokens.empty())
+    return; // feature OFF.
+
+  // Cell ids start above the dense register id space (1..N).
+  int64_t nextBase = static_cast<int64_t>(storageToId.size()) + 1;
+
+  // Collect distinct memories from their read/write ops, in deterministic walk
+  // order (robust to whether the handle is arc.memory or arc.alloc_memory).
+  SmallVector<Value> memVals;
+  llvm::DenseSet<Operation *> seen;
+  module.walk([&](Operation *op) {
+    Value mem;
+    if (auto w = dyn_cast<MemoryWriteOp>(op))
+      mem = w.getMemory();
+    else if (auto r = dyn_cast<MemoryReadOp>(op))
+      mem = r.getMemory();
+    if (!mem)
+      return;
+    Operation *md = mem.getDefiningOp();
+    if (md && seen.insert(md).second)
+      memVals.push_back(mem);
+  });
+
+  llvm::StringSet<> matchedTokens;
+  for (Value mem : memVals) {
+    StringRef name = getMemoryName(mem);
+    llvm::errs() << "[causality] #12 memory candidate: '"
+                 << (name.empty() ? StringRef("<unnamed>") : name) << "'\n";
+    if (name.empty())
+      continue;
+    StringRef matched;
+    for (auto &tok : memScopeTokens)
+      if (name.contains(tok)) {
+        matched = tok;
+        matchedTokens.insert(tok);
+        break;
+      }
+    if (matched.empty())
+      continue;
+    auto memTy = dyn_cast<MemoryType>(mem.getType());
+    if (!memTy)
+      continue;
+    int64_t depth = static_cast<int64_t>(memTy.getNumWords());
+    // Stage A is int32-safe; fail loud if the cell-id range would overflow the
+    // int32 trace serialization (then the Stage-B int64 format is required).
+    if (nextBase + depth >= 0x7fffffffLL) {
+      module.emitError("EmitCausality #12: memory '")
+          << name << "' cell-id range [" << nextBase << ", " << nextBase + depth
+          << ") overflows int32; needs the Stage-B int64 trace format.";
+      signalPassFailure();
+      return;
+    }
+    MemInfo mi{nextBase, depth, name.str()};
+    memToInfo[mem.getDefiningOp()] = mi;
+    orderedMems.push_back(mi);
+    llvm::errs() << "[causality] #12 memory IN SCOPE: '" << name << "' base="
+                 << mi.base << " depth=" << depth << "\n";
+    nextBase += depth;
+  }
+
+  // Fail loud if a configured token matched no memory (no silent no-op).
+  for (auto &tok : memScopeTokens)
+    if (!matchedTokens.contains(tok)) {
+      module.emitError("EmitCausality #12: --causality-memories token '")
+          << tok << "' matched no memory (see the memory-candidate list above).";
+      signalPassFailure();
+      return;
+    }
 }
 
 // =======================================================================
@@ -389,6 +539,22 @@ void EmitCausalityPass::writeSignalIndex() {
       e["signal_name"] = name.str();
     writeSites.push_back(llvm::json::Value(std::move(e)));
   });
+  // #12: append in-scope memory write-sites (identified by memory_name; the
+  // target cell is dynamic so there is no single signal_id).
+  if (!memToInfo.empty()) {
+    module.walk([&](MemoryWriteOp op) {
+      auto it = memToInfo.find(op.getMemory().getDefiningOp());
+      if (it == memToInfo.end())
+        return;
+      int64_t wsid = writeOpToSiteId.lookup(op.getOperation());
+      if (wsid == 0)
+        return;
+      llvm::json::Object e;
+      e["write_site_id"] = wsid;
+      e["memory_name"] = it->second.name;
+      writeSites.push_back(llvm::json::Value(std::move(e)));
+    });
+  }
   root["write_sites"] = llvm::json::Value(std::move(writeSites));
 
   // Comb site table: one entry per SOURCE comb.and / comb.or (keyed by the
@@ -433,6 +599,22 @@ void EmitCausalityPass::writeSignalIndex() {
     cmpSites.push_back(llvm::json::Value(std::move(e)));
   });
   root["cmp_sites"] = llvm::json::Value(std::move(cmpSites));
+
+  // #12: memory table (additive; only emitted when memories are instrumented).
+  // Each memory owns cell sink ids [base_id, base_id+depth).  Consumers expand a
+  // memory observable name to that range.  Absent when the feature is off ⇒
+  // __signal_index.json byte-identical to register-only.
+  if (!orderedMems.empty()) {
+    llvm::json::Array mems;
+    for (auto &mi : orderedMems) {
+      llvm::json::Object e;
+      e["name"] = mi.name;
+      e["base_id"] = mi.base;
+      e["depth"] = mi.depth;
+      mems.push_back(llvm::json::Value(std::move(e)));
+    }
+    root["memories"] = llvm::json::Value(std::move(mems));
+  }
 
   std::string outPath = opts.causalityDir + "/__signal_index.json";
   std::error_code ec;
@@ -509,6 +691,26 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
   emitCommit(builder, loc);
 }
 
+// NEXT_STEPS #12: instrument an in-scope arc.memory_write as a cell write event.
+// sink_id = base + addr (runtime), value = the written word; the recorder walks
+// the written data's cone exactly like a register write.
+void EmitCausalityPass::injectForMemWrite(OpBuilder &builder,
+                                          MemoryWriteOp writeOp,
+                                          const MemInfo &mi, int64_t wsid) {
+  Location loc = writeOp.getLoc();
+  Value addr = writeOp.getAddress();
+  Value data = writeOp.getData();
+  int32_t numBits = 0;
+  if (auto itype = dyn_cast<IntegerType>(data.getType()))
+    numBits = static_cast<int32_t>(itype.getWidth());
+
+  Value sinkVal = cellId(builder, loc, mi.base, addr);
+  emitBeginDynamic(builder, loc, sinkVal, wsid, data, numBits);
+  RecorderInfo info = getOrEmitRecorder(data);
+  builder.create<func::CallOp>(loc, info.funcOp, ValueRange(info.liveIns));
+  emitCommit(builder, loc);
+}
+
 // =======================================================================
 // getOrEmitRecorder: memoized per-value recorder emission
 //
@@ -577,6 +779,59 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
     RecorderInfo info{recFunc, {}};
     recorderCache[val] = info;
     return info;
+  }
+
+  // -----------------------------------------------------------------------
+  // arc.memory_read (NEXT_STEPS #12): an in-scope memory read links to the cell
+  // it read (cell_sink_id = base + addr) via a DATA predecessor — the existing
+  // time-delta=-1 resolution makes that "the last writer of that cell" — and
+  // recurses the ADDRESS cone so guards that select the address enter the slice.
+  // Out-of-scope memories fall through to the generic handler (address-only, as
+  // before), so the feature-off behaviour is byte-identical.
+  // -----------------------------------------------------------------------
+  if (auto readOp = dyn_cast<MemoryReadOp>(defOp)) {
+    auto mi = memToInfo.find(readOp.getMemory().getDefiningOp());
+    if (mi != memToInfo.end()) {
+      Value addr = readOp.getAddress();
+      RecorderInfo addrInfo = getOrEmitRecorder(addr);
+
+      llvm::SetVector<Value> liveInSet;
+      liveInSet.insert(addr);
+      for (auto v : addrInfo.liveIns)
+        liveInSet.insert(v);
+      SmallVector<Value> liveIns(liveInSet.begin(), liveInSet.end());
+
+      SmallVector<Type> argTypes;
+      for (auto v : liveIns)
+        argTypes.push_back(v.getType());
+      auto funcType = FunctionType::get(ctx, argTypes, {});
+
+      OpBuilder modBuilder(ctx);
+      modBuilder.setInsertionPointToEnd(module.getBody());
+      std::string recName = "__caus_rec_" + std::to_string(recorderCounter++);
+      dbg("memory_read in-scope base=" + llvm::Twine(mi->second.base) +
+          " -> recorder " + recName);
+      auto recFunc = modBuilder.create<func::FuncOp>(loc, recName, funcType);
+      recFunc.setVisibility(SymbolTable::Visibility::Private);
+
+      RecorderInfo info{recFunc, liveIns};
+      recorderCache[val] = info;
+
+      Block *body = recFunc.addEntryBlock();
+      OpBuilder bodyBuilder(body, body->end());
+      DenseMap<Value, Value> argMap;
+      for (auto [modelVal, blockArg] : llvm::zip(liveIns, body->getArguments()))
+        argMap[modelVal] = blockArg;
+
+      // cell sink id = base + zext(addr); link to the last writer of that cell.
+      Value cell = cellId(bodyBuilder, loc, mi->second.base, argMap[addr]);
+      emitAddPredDynamic(bodyBuilder, loc, cell, ROLE_DATA, -1);
+      // recurse the address cone (guards selecting which cell is read).
+      emitRecorderCall(bodyBuilder, loc, addrInfo, argMap);
+      bodyBuilder.create<func::ReturnOp>(loc);
+      return info;
+    }
+    // out of scope: fall through to the generic handler below.
   }
 
   // -----------------------------------------------------------------------
@@ -954,6 +1209,29 @@ void EmitCausalityPass::emitAddCmpPred(OpBuilder &b, Location loc,
 
 void EmitCausalityPass::emitCommit(OpBuilder &b, Location loc) {
   b.create<func::CallOp>(loc, commitDecl, ValueRange{});
+}
+
+// NEXT_STEPS #12: begin/add_pred variants taking a RUNTIME-computed i64 sink/pred
+// id (cell = base + addr), vs the constant-id register variants above.
+void EmitCausalityPass::emitBeginDynamic(OpBuilder &b, Location loc,
+                                         Value sinkI64, int64_t wsid,
+                                         Value newVal, int32_t numBits) {
+  b.create<func::CallOp>(loc, beginDecl,
+                         ValueRange{sinkI64, cI64(b, loc, wsid),
+                                    toI64(b, loc, newVal), cI32(b, loc, numBits)});
+}
+
+void EmitCausalityPass::emitAddPredDynamic(OpBuilder &b, Location loc,
+                                           Value predI64, int8_t role,
+                                           int8_t delta) {
+  b.create<func::CallOp>(
+      loc, addPredDecl,
+      ValueRange{predI64, cI8(b, loc, role), cI8(b, loc, delta)});
+}
+
+Value EmitCausalityPass::cellId(OpBuilder &b, Location loc, int64_t base,
+                                Value addr) {
+  return b.create<arith::AddIOp>(loc, cI64(b, loc, base), toI64(b, loc, addr));
 }
 
 // =======================================================================
