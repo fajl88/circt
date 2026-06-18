@@ -169,6 +169,9 @@ private:
 
   // relational comb.icmp Operation* → 1-indexed cmp site ID (NEXT_STEPS #5)
   DenseMap<Operation *, int64_t> cmpOpToSiteId;
+  // comb.mux ops carrying a trace.mux_site_id (forced mux-select, #5 v2). Separate
+  // additive id space; the path-sensitive mux recorder emits a decision event per site.
+  DenseMap<Operation *, int64_t> muxOpToSiteId;
 
   // NEXT_STEPS #12: memory-cell instrumentation. A memory is in scope if its
   // "name" attr contains any token from --causality-memories. Each in-scope
@@ -187,7 +190,8 @@ private:
   SmallVector<MemInfo> orderedMems;         // deterministic order, for the index
 
   // External function declarations added to the module
-  func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl, addCmpPredDecl;
+  func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl, addCmpPredDecl,
+      addMuxDecisionDecl;
 
   // -----------------------------------------------------------------------
   // Memoized recorder functions.
@@ -224,6 +228,7 @@ private:
   void enumWriteSites();
   void enumCombSites();
   void enumCmpSites();
+  void enumMuxSites();
   void writeSignalIndex();
   void declareRuntimeFuncs();
   void injectForWrite(OpBuilder &b, StateWriteOp writeOp, int64_t sinkId);
@@ -238,6 +243,8 @@ private:
                        int64_t operand, Value isIdentityI8);
   void emitAddCmpPred(OpBuilder &b, Location loc, int64_t siteId,
                       int64_t predicate, Value boundaryI8);
+  void emitAddMuxDecision(OpBuilder &b, Location loc, int64_t siteId,
+                          Value selValueI8, Value inputsDifferI8);
   void emitCommit(OpBuilder &b, Location loc);
 
   // NEXT_STEPS #12: dynamic (runtime-Value) sink/pred ids for memory cells.
@@ -291,6 +298,7 @@ void EmitCausalityPass::runOnOperation() {
   enumMemories(); // #12: must follow enumSignals (allocates above reg watermark)
   enumCombSites();
   enumCmpSites();
+  enumMuxSites();
   enumWriteSites();
   writeSignalIndex();
   declareRuntimeFuncs();
@@ -420,12 +428,14 @@ void EmitCausalityPass::enumMemories() {
     if (!memTy)
       continue;
     int64_t depth = static_cast<int64_t>(memTy.getNumWords());
-    // Stage A is int32-safe; fail loud if the cell-id range would overflow the
-    // int32 trace serialization (then the Stage-B int64 format is required).
-    if (nextBase + depth >= 0x7fffffffLL) {
+    // Stage B (trace format v4) serializes sink_id/pred_id as int64, so cell-id ranges
+    // are bounded only by INT64_MAX (Stage A's int32 guard is lifted). The fail-loud
+    // remains for the pathological/overflow case — a range past INT64_MAX means a bug
+    // upstream, never a real memory.
+    if (nextBase < 0 || depth < 0 || nextBase > 0x7fffffffffffffffLL - depth) {
       module.emitError("EmitCausality #12: memory '")
           << name << "' cell-id range [" << nextBase << ", " << nextBase + depth
-          << ") overflows int32; needs the Stage-B int64 trace format.";
+          << ") overflows int64 — upstream bug (memory depth or base is implausible).";
       signalPassFailure();
       return;
     }
@@ -484,6 +494,20 @@ void EmitCausalityPass::enumCmpSites() {
       return;
     if (auto a = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id"))
       cmpOpToSiteId[op] = a.getInt();
+  });
+}
+
+void EmitCausalityPass::enumMuxSites() {
+  // Source-anchored mux-site IDs (#5 v2 broken-conditional): each comb.mux carries a
+  // stable `trace.mux_site_id` stamped at top.mlir (tools/tag_comb_sites.py tag-mux)
+  // before arc lowering. A SEPARATE additive id space — the id names the same SOURCE
+  // mux in the trace, the simulated fault, and the Verilog miter. Untagged muxes
+  // (synthesized, or the switchable-injection muxes) get no id.
+  module.walk([&](Operation *op) {
+    if (!isa<comb::MuxOp>(op))
+      return;
+    if (auto a = op->getAttrOfType<IntegerAttr>("trace.mux_site_id"))
+      muxOpToSiteId[op] = a.getInt();
   });
 }
 
@@ -600,6 +624,24 @@ void EmitCausalityPass::writeSignalIndex() {
   });
   root["cmp_sites"] = llvm::json::Value(std::move(cmpSites));
 
+  // Mux site table (#5 v2): one entry per SOURCE comb.mux (keyed by trace.mux_site_id;
+  // first inlined clone seen). Untagged muxes (id 0) are skipped.
+  llvm::json::Array muxSites;
+  llvm::DenseSet<int64_t> seenMuxIds;
+  module.walk([&](Operation *op) {
+    if (!isa<comb::MuxOp>(op))
+      return;
+    int64_t msid = muxOpToSiteId.lookup(op);
+    if (msid == 0)
+      return;
+    if (!seenMuxIds.insert(msid).second)
+      return;
+    llvm::json::Object e;
+    e["mux_site_id"] = msid;
+    muxSites.push_back(llvm::json::Value(std::move(e)));
+  });
+  root["mux_sites"] = llvm::json::Value(std::move(muxSites));
+
   // #12: memory table (additive; only emitted when memories are instrumented).
   // Each memory owns cell sink ids [base_id, base_id+depth).  Consumers expand a
   // memory observable name to that range.  Absent when the feature is off ⇒
@@ -658,6 +700,8 @@ void EmitCausalityPass::declareRuntimeFuncs() {
                                   FunctionType::get(ctx, {i64, i64, i8}, {}));
   addCmpPredDecl = getOrDeclare("causality_add_cmp_pred",
                                  FunctionType::get(ctx, {i64, i64, i8}, {}));
+  addMuxDecisionDecl = getOrDeclare("causality_add_mux_decision",
+                                     FunctionType::get(ctx, {i64, i8, i8}, {}));
 }
 
 // =======================================================================
@@ -848,6 +892,8 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
     Value cond     = muxOp.getCond();
     Value trueVal  = muxOp.getTrueValue();
     Value falseVal = muxOp.getFalseValue();
+    // #5 v2: tagged mux -> also record a decision event (sel_value, inputs_differ).
+    int64_t muxSiteId = muxOpToSiteId.lookup(defOp);
 
     dbg("comb.mux -> build mux recorder");
     RecorderInfo condInfo  = getOrEmitRecorder(cond);
@@ -856,6 +902,11 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
 
     llvm::SetVector<Value> liveInSet;
     liveInSet.insert(cond);
+    if (muxSiteId != 0) {
+      // need the data inputs directly to compute inputs_differ = (true != false)
+      liveInSet.insert(trueVal);
+      liveInSet.insert(falseVal);
+    }
     for (auto v : condInfo.liveIns)  liveInSet.insert(v);
     for (auto v : trueInfo.liveIns)  liveInSet.insert(v);
     for (auto v : falseInfo.liveIns) liveInSet.insert(v);
@@ -883,6 +934,23 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
     for (auto [modelVal, blockArg] :
          llvm::zip(liveIns, body->getArguments()))
       argMap[modelVal] = blockArg;
+
+    // 0. Decision event for a tagged mux (#5 v2 broken-conditional): record the select
+    //    value and whether the two data inputs differ — the only case where forcing the
+    //    select changes the output (the is_identity / boundary analog). Unconditional:
+    //    the call to this recorder is already under whatever conditions reach the mux.
+    if (muxSiteId != 0) {
+      Value mCond  = argMap[cond];
+      Value mTrue  = argMap[trueVal];
+      Value mFalse = argMap[falseVal];
+      Value selI8 = bodyBuilder.create<arith::ExtUIOp>(
+          loc, bodyBuilder.getI8Type(), mCond);
+      Value diff = bodyBuilder.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, mTrue, mFalse);
+      Value diffI8 = bodyBuilder.create<arith::ExtUIOp>(
+          loc, bodyBuilder.getI8Type(), diff);
+      emitAddMuxDecision(bodyBuilder, loc, muxSiteId, selI8, diffI8);
+    }
 
     // 1. Walk the condition (DATA predecessors).
     emitRecorderCall(bodyBuilder, loc, condInfo, argMap);
@@ -1205,6 +1273,14 @@ void EmitCausalityPass::emitAddCmpPred(OpBuilder &b, Location loc,
   b.create<func::CallOp>(
       loc, addCmpPredDecl,
       ValueRange{cI64(b, loc, siteId), cI64(b, loc, predicate), boundaryI8});
+}
+
+void EmitCausalityPass::emitAddMuxDecision(OpBuilder &b, Location loc,
+                                            int64_t siteId, Value selValueI8,
+                                            Value inputsDifferI8) {
+  b.create<func::CallOp>(
+      loc, addMuxDecisionDecl,
+      ValueRange{cI64(b, loc, siteId), selValueI8, inputsDifferI8});
 }
 
 void EmitCausalityPass::emitCommit(OpBuilder &b, Location loc) {
