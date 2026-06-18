@@ -498,16 +498,30 @@ void EmitCausalityPass::enumCmpSites() {
 }
 
 void EmitCausalityPass::enumMuxSites() {
-  // Source-anchored mux-site IDs (#5 v2 broken-conditional): each comb.mux carries a
-  // stable `trace.mux_site_id` stamped at top.mlir (tools/tag_comb_sites.py tag-mux)
-  // before arc lowering. A SEPARATE additive id space — the id names the same SOURCE
-  // mux in the trace, the simulated fault, and the Verilog miter. Untagged muxes
-  // (synthesized, or the switchable-injection muxes) get no id.
+  // Mux-site IDs (#5 v2 broken-conditional): number EVERY comb.mux the pass sees, in
+  // deterministic pre-order walk, 1-indexed. We deliberately do NOT read a source-stamped
+  // `trace.mux_site_id`: arc lowering (MergeIfs/canonicalization) REBUILDS the
+  // register-cone muxes the recorder walks, so a top.mlir tag survives only on out-of-cone
+  // muxes the recorder never visits. (Confirmed on rocket: 1722 tagged survivors vs 2377
+  // DIFFERENT muxes actually walked → 0 recorded.) Numbering in-pass guarantees the walked
+  // muxes have ids. comb.icmp / and / or keep source-stamped ids because they are NOT
+  // restructured this way; comb.mux is the exception.
+  //
+  // Consequence: mux ids are ARCILATOR-PATH-LOCAL (a deterministic property of this one
+  // model build), not source-anchored across the firtool export path. That is correct for
+  // the recorder + the runtime-switchable injection (ONE arcilator build, runtime fault
+  // select — ref and fault share these ids). The miter cut-wire (`__mux_site_N` matched
+  // ref-vs-fault via a separate firtool export) needs its own anchoring — a deferred
+  // problem, and one source-tagging could never have solved for muxes anyway.
+  //
+  // Determinism: module.walk is pre-order and stable, and InjectFault's switchable mux pass
+  // must number identically (same walk) when the injection side lands, so the recorder id N
+  // and the injected `__fault_en_mux_N` refer to the same mux.
+  int64_t n = 0;
   module.walk([&](Operation *op) {
     if (!isa<comb::MuxOp>(op))
       return;
-    if (auto a = op->getAttrOfType<IntegerAttr>("trace.mux_site_id"))
-      muxOpToSiteId[op] = a.getInt();
+    muxOpToSiteId[op] = ++n;
   });
 }
 
@@ -624,8 +638,8 @@ void EmitCausalityPass::writeSignalIndex() {
   });
   root["cmp_sites"] = llvm::json::Value(std::move(cmpSites));
 
-  // Mux site table (#5 v2): one entry per SOURCE comb.mux (keyed by trace.mux_site_id;
-  // first inlined clone seen). Untagged muxes (id 0) are skipped.
+  // Mux site table (#5 v2): one entry per comb.mux (keyed by the pass-assigned
+  // mux_site_id from enumMuxSites; deduped if the same op is walked twice).
   llvm::json::Array muxSites;
   llvm::DenseSet<int64_t> seenMuxIds;
   module.walk([&](Operation *op) {
