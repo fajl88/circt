@@ -116,7 +116,12 @@ void InferMemoriesPass::runOnOperation() {
     }
     auto memType = MemoryType::get(&getContext(), depth, wordType, addressTy);
     auto memOp = MemoryOp::create(builder, memType);
-    if (tapMemories && !instOp.getInstanceName().empty())
+    // Name the memory UNCONDITIONALLY (NEXT_STEPS #12). EmitCausality's --causality-memories
+    // matches memories by this "name" attr; naming must NOT require --observe-memories, which
+    // taps every port and dumps every cell every cycle (~0.5 GB traces). The observation taps
+    // below stay gated on `tapMemories`; only the name is now always set — a benign attr that
+    // (per audit) only EmitCausality consumes.
+    if (!instOp.getInstanceName().empty())
       memOp->setAttr("name", instOp.getInstanceNameAttr());
 
     unsigned argIdx = 0;
