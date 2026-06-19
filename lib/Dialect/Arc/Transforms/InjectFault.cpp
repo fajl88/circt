@@ -34,10 +34,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include <string>
 #include <utility>
@@ -155,40 +157,23 @@ static LogicalResult faultCombOp(Operation *targetOp, int operand,
   return success();
 }
 
-// The off-by-one involution on relational predicates (NEXT_STEPS #5): the only
-// mutation whose disagreement set is exactly {lhs == rhs}. eq/ne map to themselves
-// (excluded — not relational; their off-by-one partner is the complement).
-static comb::ICmpPredicate offByOnePartner(comb::ICmpPredicate p) {
-  using P = comb::ICmpPredicate;
-  switch (p) {
-  case P::slt: return P::sle;  case P::sle: return P::slt;
-  case P::sgt: return P::sge;  case P::sge: return P::sgt;
-  case P::ult: return P::ule;  case P::ule: return P::ult;
-  case P::ugt: return P::uge;  case P::uge: return P::ugt;
-  default:     return p;
+// Collect the source mux ids encoded in a synthetic location (#5): a FileLineColLoc
+// with filename "mux_site" carries the source id in its line field (stamped by
+// tools/tag_comb_sites.py tag-mux). Mux attributes do NOT survive arc lowering, but the
+// LOCATION does, so this recovers a cone mux's source id post-lowering. Recurses
+// FusedLoc / NameLoc; returns the SET of distinct ids (a clean source mux → exactly 1).
+// Mirrors EmitCausality::collectMuxSiteIds (the recorder side); kept in sync.
+static void collectMuxSiteIds(Location loc,
+                              llvm::SmallDenseSet<int64_t, 2> &ids) {
+  if (auto flc = dyn_cast<FileLineColLoc>(loc)) {
+    if (flc.getFilename().getValue() == "mux_site")
+      ids.insert(static_cast<int64_t>(flc.getLine()));
+  } else if (auto fused = dyn_cast<FusedLoc>(loc)) {
+    for (Location sub : fused.getLocations())
+      collectMuxSiteIds(sub, ids);
+  } else if (auto named = dyn_cast<NameLoc>(loc)) {
+    collectMuxSiteIds(named.getChildLoc(), ids);
   }
-}
-
-// Baked off-by-one mutation: flip a marked relational comb.icmp's predicate to its
-// off-by-one partner in place (the result naturally reflects the new predicate).
-// Used on the firtool/ExportVerilog (miter) path, analogous to faultCombOp.
-static LogicalResult faultCmpOp(Operation *targetOp, int64_t idForMsg) {
-  auto icmp = dyn_cast<comb::ICmpOp>(targetOp);
-  if (!icmp) {
-    targetOp->emitError("InjectFault: cmp_site_id=")
-        << idForMsg << " marked op is not a comb.icmp";
-    return failure();
-  }
-  comb::ICmpPredicate p = icmp.getPredicate();
-  comb::ICmpPredicate partner = offByOnePartner(p);
-  if (partner == p) {
-    targetOp->emitError("InjectFault: cmp_site_id=")
-        << idForMsg << " predicate is not relational (no off-by-one partner; "
-        << "eq/ne are excluded)";
-    return failure();
-  }
-  icmp.setPredicate(partner);
-  return success();
 }
 
 // Baked forced-mux-select (broken conditional, NEXT_STEPS #5): replace a marked
@@ -228,37 +213,41 @@ static LogicalResult faultMuxOp(Operation *targetOp, int forcedBit,
 // ---------------------------------------------------------------------------
 // Switchable mode (NEXT_STEPS #6, coord/contracts/switchable_fault.md).
 //
-// Make EVERY trace.comb_site_id-tagged gate operand runtime-switchable:
+// Two fault classes share ONE binary, selected at runtime by an i8 class byte:
 //
-//   %en   = arc.state_read %__fault_en_<site>_<k> : i8     (fault-class byte)
-//   %on   = comb.icmp eq %en, 1                            (1 = guard removal)
-//   %op'  = comb.mux %on, <identity>, %operand
+//   GUARD REMOVAL (class 1) — every trace.comb_site_id-tagged comb.and/comb.or
+//   operand becomes runtime-switchable:
+//     %en   = arc.state_read %__fault_en_<site>_<k> : i8
+//     %on   = comb.icmp eq %en, 1
+//     %op'  = comb.mux %on, <identity>, %operand
 //
-// The i8 enable states are allocated in the enclosing arc.model body (this
-// pass runs BEFORE state allocation, so AllocateState assigns them offsets and
-// ModelInfo exports them to model_state.json by name, where the driver
-// resolves and pokes them). EmitCausality already ran, so the instrumentation
-// recorded the ORIGINAL dataflow against unchanged signal/write-site ids —
-// with all enables 0 the muxes pass the original operands through and the
-// model computes bit-identical values. The class byte compares against 1
-// specifically (not != 0) so future fault classes (NEXT_STEPS #6b) get their
-// own selects instead of aliasing onto guard removal.
+//   FORCED MUX-SELECT (classes 3/4, the broken conditional, NEXT_STEPS #5) —
+//   every clean source comb.mux has its select runtime-gated:
+//     %en   = arc.state_read %__fault_en_mux_<N> : i8
+//     %sel' = (en==3) ? 0 : (en==4) ? 1 : %origSel   // 3 = force false arm, 4 = force true arm
+//   The source mux is identified by its synthetic loc("mux_site":N) — mux
+//   attributes do NOT survive arc lowering, but the location does, so all inlined
+//   clones of source mux N carry id N and share __fault_en_mux_<N>: enabling N
+//   faults every descendant, the runtime analog of the baked faultMuxOp.
 //
-// Clones: all inlined copies of one source gate share the same (site, k)
-// enable state — switching a site faults every clone, exactly like the baked
-// guard-removal mode.
+// The i8 enable states are allocated in the enclosing arc.model body (this pass
+// runs BEFORE state allocation, so AllocateState assigns offsets and ModelInfo
+// exports them to model_state.json by name, where the driver resolves and pokes
+// them). EmitCausality already ran, so with all enables 0 the inserted muxes pass
+// the originals through and the model is bit-identical to the reference. Class
+// bytes are compared exactly (==1, ==3, ==4) so the classes never alias.
 // ---------------------------------------------------------------------------
 
 static LogicalResult runSwitchable(ModuleOp module) {
-  // Tagged gates must all live inside an arc.model body — that is where the
-  // storage block argument for the enable states lives. A tagged gate outside
-  // any model could not be switched and would silently diverge from the baked
-  // mode, so it is a hard error.
+  // Switchable sites must live inside an arc.model body — that is where the
+  // storage block argument for the enable states lives. A site outside any model
+  // could not be switched and would silently diverge from the baked mode, a hard
+  // error.
   DenseMap<ModelOp, SmallVector<Operation *>> gatesByModel;
-  DenseMap<ModelOp, SmallVector<Operation *>> cmpsByModel;  // NEXT_STEPS #5
-  int64_t taggedTotal = 0, taggedCmpTotal = 0;
+  DenseMap<ModelOp, SmallVector<Operation *>> muxesByModel; // forced mux-select (#5)
+  int64_t taggedTotal = 0, taggedMuxTotal = 0;
   WalkResult walkRes = module.walk([&](Operation *op) -> WalkResult {
-    // comb.and / comb.or guard-removal sites
+    // comb.and / comb.or guard-removal sites (by the surviving trace.comb_site_id attr).
     if (isa<comb::AndOp, comb::OrOp>(op) &&
         op->hasAttrOfType<IntegerAttr>("trace.comb_site_id")) {
       ++taggedTotal;
@@ -272,18 +261,23 @@ static LogicalResult runSwitchable(ModuleOp module) {
       gatesByModel[model].push_back(op);
       return WalkResult::advance();
     }
-    // relational comb.icmp off-by-one sites
-    if (isa<comb::ICmpOp>(op) &&
-        op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id")) {
-      ++taggedCmpTotal;
-      auto model = op->getParentOfType<ModelOp>();
-      if (!model) {
-        op->emitError("InjectFault(switchable): tagged comb.icmp (cmp_site_id=")
-            << op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt()
-            << ") is not inside an arc.model — cannot allocate its enable state";
-        return WalkResult::interrupt();
+    // forced mux-select sites: a comb.mux whose synthetic location names exactly ONE
+    // source mux id (the clean 99.1%; fused/synthesized muxes can't be cleanly
+    // attributed, so they are skipped — matching the recorder's exclusion).
+    if (isa<comb::MuxOp>(op)) {
+      llvm::SmallDenseSet<int64_t, 2> ids;
+      collectMuxSiteIds(op->getLoc(), ids);
+      if (ids.size() == 1) {
+        ++taggedMuxTotal;
+        auto model = op->getParentOfType<ModelOp>();
+        if (!model) {
+          op->emitError("InjectFault(switchable): source mux (mux_site_id=")
+              << *ids.begin()
+              << ") is not inside an arc.model — cannot allocate its enable state";
+          return WalkResult::interrupt();
+        }
+        muxesByModel[model].push_back(op);
       }
-      cmpsByModel[model].push_back(op);
       return WalkResult::advance();
     }
     return WalkResult::advance();
@@ -291,10 +285,10 @@ static LogicalResult runSwitchable(ModuleOp module) {
   if (walkRes.wasInterrupted())
     return failure();
 
-  if (taggedTotal == 0 && taggedCmpTotal == 0) {
+  if (taggedTotal == 0 && taggedMuxTotal == 0) {
     module.emitError(
-        "InjectFault(switchable): no trace.comb_site_id / trace.cmp_site_id-tagged "
-        "ops found (was the input run through the comb-site tagging step?)");
+        "InjectFault(switchable): no trace.comb_site_id-tagged gates and no "
+        "mux_site-located muxes found (was the input run through tag + tag-mux?)");
     return failure();
   }
 
@@ -368,12 +362,11 @@ static LogicalResult runSwitchable(ModuleOp module) {
     }
   }
 
-  // Comparison off-by-one sites (NEXT_STEPS #5): mux the icmp RESULT between the
-  // original and its off-by-one partner predicate, selected by the class byte en == 2.
-  // Per-site (clones share __fault_en_cmp_<N>); disabled (en != 2) passes the original
-  // through, bit-identical to reference.
-  int64_t numCmpEnableStates = 0, numMuxedCmps = 0;
-  for (auto &[model, cmps] : cmpsByModel) {
+  // Forced mux-select (#5): gate each clean source mux's select on __fault_en_mux_<N>.
+  // en==3 forces the select to 0 (false arm), en==4 to 1 (true arm); en==0 (and the
+  // guard-removal class 1) leave the original select untouched, bit-identical to ref.
+  int64_t numMuxEnableStates = 0, numGatedMuxes = 0;
+  for (auto &[model, muxes] : muxesByModel) {
     Block &body = model.getBodyBlock();
     if (body.getNumArguments() < 1) {
       model.emitError("InjectFault(switchable): arc.model body has no storage "
@@ -385,49 +378,46 @@ static LogicalResult runSwitchable(ModuleOp module) {
     allocBuilder.setInsertionPointToStart(&body);
     auto i8Ty = allocBuilder.getIntegerType(8);
 
-    DenseMap<int64_t, Value> cmpEnableState; // per cmp_site_id; clones share
-    for (Operation *op : cmps) {
-      auto icmp = cast<comb::ICmpOp>(op);
-      int64_t siteId =
-          op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
-      comb::ICmpPredicate partner = offByOnePartner(icmp.getPredicate());
-      if (partner == icmp.getPredicate()) {
-        op->emitError("InjectFault(switchable): cmp_site_id=")
-            << siteId << " predicate is not relational (no off-by-one partner)";
-        return failure();
-      }
-
-      Value &state = cmpEnableState[siteId];
+    DenseMap<int64_t, Value> muxEnableState; // per source mux id; clones share
+    for (Operation *op : muxes) {
+      llvm::SmallDenseSet<int64_t, 2> ids;
+      collectMuxSiteIds(op->getLoc(), ids);
+      int64_t siteId = *ids.begin();
+      Value &state = muxEnableState[siteId];
       if (!state) {
         auto alloc = AllocStateOp::create(allocBuilder, model.getLoc(),
                                           StateType::get(i8Ty), storage);
         alloc->setAttr("name", allocBuilder.getStringAttr(
-                                   "__fault_en_cmp_" + std::to_string(siteId)));
+                                   "__fault_en_mux_" + std::to_string(siteId)));
         state = alloc;
-        ++numCmpEnableStates;
+        ++numMuxEnableStates;
       }
 
+      auto mux = cast<comb::MuxOp>(op);
       OpBuilder b(op);
-      b.setInsertionPointAfter(op);
       Location loc = op->getLoc();
-      Value origResult = icmp.getResult();
-      Value mutated =
-          comb::ICmpOp::create(b, loc, partner, icmp.getLhs(), icmp.getRhs());
+      Value origSel = mux.getCond();
       Value en = StateReadOp::create(b, loc, state);
-      Value cls2 = hw::ConstantOp::create(b, loc, APInt(8, 2));
-      Value on = comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, en, cls2);
-      Value muxed = comb::MuxOp::create(b, loc, on, mutated, origResult);
-      origResult.replaceAllUsesExcept(muxed, muxed.getDefiningOp());
-      ++numMuxedCmps;
+      Value c3 = hw::ConstantOp::create(b, loc, APInt(8, 3));
+      Value c4 = hw::ConstantOp::create(b, loc, APInt(8, 4));
+      Value is3 = comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, en, c3);
+      Value is4 = comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, en, c4);
+      Value sel0 = hw::ConstantOp::create(b, loc, APInt(1, 0));
+      Value sel1 = hw::ConstantOp::create(b, loc, APInt(1, 1));
+      // en==4 -> 1 (true arm) else original; then en==3 -> 0 (false arm).
+      Value selT = comb::MuxOp::create(b, loc, is4, sel1, origSel);
+      Value selF = comb::MuxOp::create(b, loc, is3, sel0, selT);
+      mux.setOperand(0, selF);
+      ++numGatedMuxes;
     }
   }
 
   llvm::errs() << "[inject-fault] switchable: " << taggedTotal
                << " tagged gate clones, " << numEnableStates
                << " __fault_en_<site>_<operand> states, " << numMuxedOperands
-               << " operands muxed; " << taggedCmpTotal << " tagged icmp clones, "
-               << numCmpEnableStates << " __fault_en_cmp_<site> states, "
-               << numMuxedCmps << " icmp results muxed\n";
+               << " operands muxed; " << taggedMuxTotal << " source-mux clones, "
+               << numMuxEnableStates << " __fault_en_mux_<site> states, "
+               << numGatedMuxes << " mux selects gated\n";
   return success();
 }
 
@@ -530,16 +520,11 @@ void InjectFaultPass::runOnOperation() {
     for (auto *op : ops)
       targets.push_back({op, opts.faultCombOperand});
   } else {
-    SmallVector<Operation *> cmpMarked;
     SmallVector<Operation *> muxMarked; // forced-mux-select (NEXT_STEPS #5)
     module.walk([&](Operation *op) {
       if (isa<comb::AndOp, comb::OrOp>(op)) {
         if (auto a = op->getAttrOfType<IntegerAttr>("trace.fault_target"))
           targets.push_back({op, static_cast<int>(a.getInt())});
-      } else if (isa<comb::ICmpOp>(op) &&
-                 op->hasAttrOfType<IntegerAttr>("trace.fault_target") &&
-                 op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id")) {
-        cmpMarked.push_back(op); // off-by-one baked mutation (NEXT_STEPS #5)
       } else if (isa<comb::MuxOp>(op) &&
                  op->hasAttrOfType<IntegerAttr>("trace.mux_force") &&
                  op->hasAttrOfType<IntegerAttr>("trace.mux_site_id")) {
@@ -551,15 +536,8 @@ void InjectFaultPass::runOnOperation() {
       }
     });
     // Marked mode with nothing marked is a deliberate pass-through no-op.
-    if (targets.empty() && cmpMarked.empty() && muxMarked.empty())
+    if (targets.empty() && muxMarked.empty())
       return;
-    for (Operation *op : cmpMarked) {
-      int64_t id = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
-      if (failed(faultCmpOp(op, id))) {
-        signalPassFailure();
-        return;
-      }
-    }
     for (Operation *op : muxMarked) {
       int64_t id = op->getAttrOfType<IntegerAttr>("trace.mux_site_id").getInt();
       int force = static_cast<int>(
@@ -647,24 +625,6 @@ void MaterializeCombWiresPass::runOnOperation() {
     // the gate result).
     res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
   }
-  // Cmp cut wires (NEXT_STEPS #5): same symbol-bearing hw.wire scheme for tagged
-  // relational comb.icmp results, so __cmp_site_<N> survives in ref + fault Verilog.
-  SmallVector<Operation *> cmps;
-  module.walk([&](Operation *op) {
-    if (isa<comb::ICmpOp>(op) &&
-        op->hasAttrOfType<IntegerAttr>("trace.cmp_site_id"))
-      cmps.push_back(op);
-  });
-  for (Operation *op : cmps) {
-    int64_t id = op->getAttrOfType<IntegerAttr>("trace.cmp_site_id").getInt();
-    Value res = op->getResult(0);
-    OpBuilder b(op);
-    b.setInsertionPointAfter(op);
-    StringAttr nameAttr = b.getStringAttr("__cmp_site_" + std::to_string(id));
-    auto wire = hw::WireOp::create(b, op->getLoc(), res, nameAttr,
-                                   hw::InnerSymAttr::get(nameAttr));
-    res.replaceAllUsesExcept(wire.getResult(), wire.getOperation());
-  }
   // Mux cut wires (NEXT_STEPS #5 forced-mux): wrap each tagged SOURCE comb.mux
   // result in a __mux_site_<N> symbol-bearing hw.wire, so the JG-miter cut leaf
   // survives in both ref and forced-mux Verilog independent of how the cone lowers.
@@ -695,7 +655,7 @@ void MaterializeCombWiresPass::runOnOperation() {
   int64_t stripped = 0;
   module.walk([&](Operation *op) {
     for (StringRef name :
-         {"trace.comb_site_id", "trace.cmp_site_id", "trace.fault_target",
+         {"trace.comb_site_id", "trace.fault_target",
           "trace.mux_site_id", "trace.mux_force"})
       if (op->removeAttr(name))
         ++stripped;
