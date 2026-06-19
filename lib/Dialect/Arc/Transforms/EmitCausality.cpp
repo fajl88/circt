@@ -46,6 +46,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
@@ -497,32 +498,58 @@ void EmitCausalityPass::enumCmpSites() {
   });
 }
 
+// Collect the source mux ids encoded in a synthetic location (#5 v2): a
+// FileLineColLoc with filename "mux_site" carries the source id in its line field
+// (stamped by tools/tag_comb_sites.py tag-mux). Recurses FusedLoc (a CombFolds blend
+// of two source muxes produces a fused loc) and NameLoc. Returns the SET of distinct ids.
+static void collectMuxSiteIds(Location loc, llvm::SmallDenseSet<int64_t, 2> &ids) {
+  if (auto flc = dyn_cast<FileLineColLoc>(loc)) {
+    if (flc.getFilename().getValue() == "mux_site")
+      ids.insert(static_cast<int64_t>(flc.getLine()));
+  } else if (auto fused = dyn_cast<FusedLoc>(loc)) {
+    for (Location sub : fused.getLocations())
+      collectMuxSiteIds(sub, ids);
+  } else if (auto named = dyn_cast<NameLoc>(loc)) {
+    collectMuxSiteIds(named.getChildLoc(), ids);
+  }
+}
+
 void EmitCausalityPass::enumMuxSites() {
-  // Mux-site IDs (#5 v2 broken-conditional): number EVERY comb.mux the pass sees, in
-  // deterministic pre-order walk, 1-indexed. We deliberately do NOT read a source-stamped
-  // `trace.mux_site_id`: arc lowering (MergeIfs/canonicalization) REBUILDS the
-  // register-cone muxes the recorder walks, so a top.mlir tag survives only on out-of-cone
-  // muxes the recorder never visits. (Confirmed on rocket: 1722 tagged survivors vs 2377
-  // DIFFERENT muxes actually walked → 0 recorded.) Numbering in-pass guarantees the walked
-  // muxes have ids. comb.icmp / and / or keep source-stamped ids because they are NOT
-  // restructured this way; comb.mux is the exception.
+  // Source-anchored mux-site IDs via SYNTHETIC LOCATION (#5 v2 forced-mux-select).
+  // tag-mux stamps each source comb.mux with loc("mux_site":N:0). Arc-lowering rewrites
+  // (canonicalization, inlining-context rebuilds) DROP custom attributes but PRESERVE
+  // source locations, so the cone muxes the recorder walks carry their source id in
+  // op->getLoc() even after the trace.mux_site_id ATTR is gone. (That attr-vs-loc
+  // difference is exactly why the earlier attr-reading recorder recorded 0.)
   //
-  // Consequence: mux ids are ARCILATOR-PATH-LOCAL (a deterministic property of this one
-  // model build), not source-anchored across the firtool export path. That is correct for
-  // the recorder + the runtime-switchable injection (ONE arcilator build, runtime fault
-  // select — ref and fault share these ids). The miter cut-wire (`__mux_site_N` matched
-  // ref-vs-fault via a separate firtool export) needs its own anchoring — a deferred
-  // problem, and one source-tagging could never have solved for muxes anyway.
+  // Validated on rocket (synthetic-loc diagnostic, lowered to here): of 2346 cone muxes,
+  // 99.1% carry an exact single-source mux_site loc, 0% are fused/blended, 0.9% are
+  // lowering-synthesized (register-reset / memory-port muxes — no source conditional).
   //
-  // Determinism: module.walk is pre-order and stable, and InjectFault's switchable mux pass
-  // must number identically (same walk) when the injection side lands, so the recorder id N
-  // and the injected `__fault_en_mux_N` refer to the same mux.
-  int64_t n = 0;
+  // Per mux, read the mux_site id(s) from the location:
+  //   exactly 1 id  -> the source mux id (the clean, common case): record under it.
+  //   >1 id (fused) -> a CombFolds blend merged two source conditionals; the recorded
+  //                    trigger can't be cleanly attributed to ONE -> EXCLUDE (id 0, not
+  //                    selectable). Counted + reported — never silently mis-attributed.
+  //   0 ids         -> lowering-synthesized (reg reset / mem port) -> skip (no source).
+  int64_t nClean = 0, nFused = 0, nSynth = 0;
   module.walk([&](Operation *op) {
     if (!isa<comb::MuxOp>(op))
       return;
-    muxOpToSiteId[op] = ++n;
+    llvm::SmallDenseSet<int64_t, 2> ids;
+    collectMuxSiteIds(op->getLoc(), ids);
+    if (ids.size() == 1) {
+      muxOpToSiteId[op] = *ids.begin();
+      ++nClean;
+    } else if (ids.size() > 1) {
+      ++nFused; // blended: excluded (lookup returns 0 -> recorder treats as untagged)
+    } else {
+      ++nSynth; // synthesized: no source conditional
+    }
   });
+  dbg("enumMuxSites (source-loc): " + llvm::Twine(nClean) + " clean / " +
+      llvm::Twine(nFused) + " fused-excluded / " + llvm::Twine(nSynth) +
+      " synthesized");
 }
 
 // =======================================================================
@@ -916,11 +943,10 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
 
     llvm::SetVector<Value> liveInSet;
     liveInSet.insert(cond);
-    if (muxSiteId != 0) {
-      // need the data inputs directly to compute inputs_differ = (true != false)
-      liveInSet.insert(trueVal);
-      liveInSet.insert(falseVal);
-    }
+    // The two data inputs are ALWAYS needed: inputs_differ = (true != false) gates both
+    // the #5 decision event AND the precise mux-predecessor slice (steps 1-2 below).
+    liveInSet.insert(trueVal);
+    liveInSet.insert(falseVal);
     for (auto v : condInfo.liveIns)  liveInSet.insert(v);
     for (auto v : trueInfo.liveIns)  liveInSet.insert(v);
     for (auto v : falseInfo.liveIns) liveInSet.insert(v);
@@ -949,31 +975,46 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
          llvm::zip(liveIns, body->getArguments()))
       argMap[modelVal] = blockArg;
 
+    Value mCond  = argMap[cond];
+    Value mTrue  = argMap[trueVal];
+    Value mFalse = argMap[falseVal];
+
+    // inputs_differ = (trueVal != falseVal). The select — and therefore the select's
+    // own cone (step 1) and its CONTROL_GUARD (step 2) — only CAUSES the mux output when
+    // the two arms differ; when they are equal the output is independent of the select.
+    // So this is the precise mux-predecessor condition (the mux analog of guard-removal's
+    // is_identity), and the SAME value feeds the #5 decision event.
+    Value diff = bodyBuilder.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::ne, mTrue, mFalse);
+
     // 0. Decision event for a tagged mux (#5 v2 broken-conditional): record the select
-    //    value and whether the two data inputs differ — the only case where forcing the
-    //    select changes the output (the is_identity / boundary analog). Unconditional:
-    //    the call to this recorder is already under whatever conditions reach the mux.
+    //    value and inputs_differ — the only case where forcing the select changes the
+    //    output. Unconditional: the call to this recorder is already under whatever
+    //    conditions reach the mux.
     if (muxSiteId != 0) {
-      Value mCond  = argMap[cond];
-      Value mTrue  = argMap[trueVal];
-      Value mFalse = argMap[falseVal];
       Value selI8 = bodyBuilder.create<arith::ExtUIOp>(
           loc, bodyBuilder.getI8Type(), mCond);
-      Value diff = bodyBuilder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ne, mTrue, mFalse);
       Value diffI8 = bodyBuilder.create<arith::ExtUIOp>(
           loc, bodyBuilder.getI8Type(), diff);
       emitAddMuxDecision(bodyBuilder, loc, muxSiteId, selI8, diffI8);
     }
 
-    // 1. Walk the condition (DATA predecessors).
-    emitRecorderCall(bodyBuilder, loc, condInfo, argMap);
-
-    // 2. CONTROL_GUARD if condition is a direct state read.
-    if (auto s = resolveDirectState(cond)) {
-      int64_t cid = lookupId(s);
-      if (cid != -1)
-        emitAddPred(bodyBuilder, loc, cid, ROLE_CONTROL_GUARD, -1);
+    // 1+2. The select's DATA predecessors (its cone) and its CONTROL_GUARD are
+    //      predecessors of the mux output ONLY when the arms differ — gate on
+    //      inputs_differ (precise; was previously recorded unconditionally).
+    {
+      auto diffIf =
+          bodyBuilder.create<scf::IfOp>(loc, diff, /*withElseRegion=*/false);
+      OpBuilder::InsertionGuard g(bodyBuilder);
+      bodyBuilder.setInsertionPoint(diffIf.thenBlock()->getTerminator());
+      // 1. Walk the condition (DATA predecessors).
+      emitRecorderCall(bodyBuilder, loc, condInfo, argMap);
+      // 2. CONTROL_GUARD if condition is a direct state read.
+      if (auto s = resolveDirectState(cond)) {
+        int64_t cid = lookupId(s);
+        if (cid != -1)
+          emitAddPred(bodyBuilder, loc, cid, ROLE_CONTROL_GUARD, -1);
+      }
     }
 
     // 3. Branch on runtime cond: only the taken arm contributes DATA preds.
