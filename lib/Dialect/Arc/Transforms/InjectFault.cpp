@@ -176,40 +176,6 @@ static void collectMuxSiteIds(Location loc,
   }
 }
 
-// Baked forced-mux-select (broken conditional, NEXT_STEPS #5): replace a marked
-// comb.mux's SELECT (operand 0) with a constant i1, permanently forcing the mux to
-// take ONE arm — the canonical "broken conditional" (a forgotten/stuck guard).
-//
-// Unlike guard-removal, this MUST be injected on top_tagged.mlir BEFORE arc
-// lowering, where the source mux still carries its unique trace.mux_site_id: mux
-// attributes do NOT survive arc lowering (canonicalization/inlining rebuild the
-// register cones untagged — exactly why the recorder anchors on the synthetic
-// location instead). Forcing the select on the SOURCE mux and re-lowering lets the
-// optimizer propagate the corruption through inlining/merging faithfully, so this is
-// correct for ANY source mux, including ones a later pass would merge. comb.mux is
-// `sel ? trueVal : falseVal`, so forcedBit=1 forces the TRUE arm, 0 the FALSE arm.
-static LogicalResult faultMuxOp(Operation *targetOp, int forcedBit,
-                                int64_t idForMsg) {
-  auto mux = dyn_cast<comb::MuxOp>(targetOp);
-  if (!mux) {
-    targetOp->emitError("InjectFault: mux_site_id=")
-        << idForMsg << " marked op is not a comb.mux";
-    return failure();
-  }
-  if (forcedBit != 0 && forcedBit != 1) {
-    targetOp->emitError("InjectFault: mux_site_id=")
-        << idForMsg << " force value " << forcedBit
-        << " is not 0 or 1 (the select is one bit)";
-    return failure();
-  }
-  OpBuilder b(targetOp);
-  // hw.constant (not arith.constant): the faulted module is lowered by BOTH arcilator
-  // (sim) and firtool/ExportVerilog (miter); arith isn't loaded on the verilog path.
-  Value sel = hw::ConstantOp::create(b, targetOp->getLoc(), APInt(1, forcedBit));
-  targetOp->setOperand(0, sel); // operand 0 of comb.mux is the select
-  return success();
-}
-
 // ---------------------------------------------------------------------------
 // Switchable mode (NEXT_STEPS #6, coord/contracts/switchable_fault.md).
 //
@@ -228,7 +194,7 @@ static LogicalResult faultMuxOp(Operation *targetOp, int forcedBit,
 //   The source mux is identified by its synthetic loc("mux_site":N) — mux
 //   attributes do NOT survive arc lowering, but the location does, so all inlined
 //   clones of source mux N carry id N and share __fault_en_mux_<N>: enabling N
-//   faults every descendant, the runtime analog of the baked faultMuxOp.
+//   forces the select of every descendant clone of source mux N.
 //
 // The i8 enable states are allocated in the enclosing arc.model body (this pass
 // runs BEFORE state allocation, so AllocateState assigns offsets and ModelInfo
@@ -520,33 +486,18 @@ void InjectFaultPass::runOnOperation() {
     for (auto *op : ops)
       targets.push_back({op, opts.faultCombOperand});
   } else {
-    SmallVector<Operation *> muxMarked; // forced-mux-select (NEXT_STEPS #5)
+    // Marked mode: fault every comb gate carrying trace.fault_target (guard-removal
+    // for the ExportVerilog / JG-miter path). The baked forced-mux-select marker
+    // (trace.mux_force) was removed — forced-mux is switchable-only now (see below).
     module.walk([&](Operation *op) {
       if (isa<comb::AndOp, comb::OrOp>(op)) {
         if (auto a = op->getAttrOfType<IntegerAttr>("trace.fault_target"))
           targets.push_back({op, static_cast<int>(a.getInt())});
-      } else if (isa<comb::MuxOp>(op) &&
-                 op->hasAttrOfType<IntegerAttr>("trace.mux_force") &&
-                 op->hasAttrOfType<IntegerAttr>("trace.mux_site_id")) {
-        // Baked forced-mux-select: a marker (trace.mux_force = 0|1) on the source
-        // mux at top_tagged.mlir, forced PRE-arc-lowering (where the source mux is
-        // the one op carrying trace.mux_site_id). arcilator then lowers the already-
-        // corrupted IR. This is the broken-conditional injection (NEXT_STEPS #5).
-        muxMarked.push_back(op);
       }
     });
     // Marked mode with nothing marked is a deliberate pass-through no-op.
-    if (targets.empty() && muxMarked.empty())
+    if (targets.empty())
       return;
-    for (Operation *op : muxMarked) {
-      int64_t id = op->getAttrOfType<IntegerAttr>("trace.mux_site_id").getInt();
-      int force = static_cast<int>(
-          op->getAttrOfType<IntegerAttr>("trace.mux_force").getInt());
-      if (failed(faultMuxOp(op, force, id))) {
-        signalPassFailure();
-        return;
-      }
-    }
   }
 
   for (auto &t : targets) {
@@ -655,8 +606,7 @@ void MaterializeCombWiresPass::runOnOperation() {
   int64_t stripped = 0;
   module.walk([&](Operation *op) {
     for (StringRef name :
-         {"trace.comb_site_id", "trace.fault_target",
-          "trace.mux_site_id", "trace.mux_force"})
+         {"trace.comb_site_id", "trace.fault_target", "trace.mux_site_id"})
       if (op->removeAttr(name))
         ++stripped;
   });
