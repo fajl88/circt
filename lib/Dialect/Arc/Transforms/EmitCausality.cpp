@@ -95,6 +95,17 @@ static StringRef getStateName(Value state) {
   if (auto allocOp = dyn_cast<AllocStateOp>(defOp)) {
     if (auto nameAttr = allocOp->getAttrOfType<StringAttr>("name"))
       return nameAttr.getValue();
+    // Tap-derived alloc_state (from --observe-named-values: AddTaps -> arc.tap ->
+    // LowerState writes the combinational value to an alloc_state every cycle) stores its
+    // name in a "names" ArrayAttr, not "name". Surface it so the tapped COMBINATIONAL
+    // observable (e.g. io_trace_insns_0_insn) is referenceable as a sink by config.json /
+    // the observable pool — its write events + cone are already instrumented like any state
+    // write. Sink-id enumeration is by walk order (independent of names), so ids are stable.
+    if (auto namesAttr = allocOp->getAttrOfType<ArrayAttr>("names"))
+      for (Attribute a : namesAttr)
+        if (auto s = dyn_cast<StringAttr>(a))
+          if (!s.getValue().empty())
+            return s.getValue();
     return {};
   }
   if (auto rootIn = dyn_cast<RootInputOp>(defOp))
