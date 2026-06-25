@@ -553,20 +553,29 @@ void EmitCausalityPass::writeSignalIndex() {
 
   module.walk([&](Operation *op) {
     Value stateResult;
-    StringRef name;
-    if (auto v = dyn_cast<RootInputOp>(op)) {
+    if (auto v = dyn_cast<RootInputOp>(op))
       stateResult = v.getState();
-      name = v.getName();
-    } else if (auto v = dyn_cast<RootOutputOp>(op)) {
+    else if (auto v = dyn_cast<RootOutputOp>(op))
       stateResult = v.getState();
-      name = v.getName();
-    } else if (auto v = dyn_cast<AllocStateOp>(op)) {
+    else if (auto v = dyn_cast<AllocStateOp>(op))
       stateResult = v.getState();
-      if (auto a = v->getAttrOfType<StringAttr>("name"))
-        name = a.getValue();
-    }
     if (!stateResult)
       return;
+
+    // Resolve the signal name via getStateName (NOT the singular "name" attr
+    // only). Tap-derived alloc_states (from --observe-named-values: AddTaps ->
+    // arc.tap -> LowerState writes the COMBINATIONAL value to an alloc_state
+    // every cycle) store their name in a "names" ArrayAttr, not "name", so the
+    // old singular-"name" read left them as "reg_<id>" in this `signals` array —
+    // the exact table the observable resolver / slice gate looks up by name.
+    // That is why combinational observation-sinks like BOOM
+    // io_trace_insns_0_{iaddr,insn,wdata} (present in `write_sites` via
+    // getStateName, but "reg_N" here) failed to resolve. getStateName surfaces
+    // them by their real name. IDs are unchanged (walk order, name-independent),
+    // so this is additive: already-named states keep their id; previously
+    // unnamed tap states gain their real name. A build with NO taps (e.g.
+    // Rocket, no --observe-named-values) has no "names" attrs => byte-identical.
+    StringRef name = getStateName(stateResult);
 
     llvm::json::Object entry;
     entry["id"] = counter++;
