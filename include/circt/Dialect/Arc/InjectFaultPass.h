@@ -15,23 +15,26 @@ namespace circt {
 namespace arc {
 
 struct InjectFaultPassOptions {
-  int faultWriteSiteId = 0; // write site ID for bit-flip injection (0 = disabled)
-  int faultBit = 0;         // bit position to flip (bit-flip only)
   int faultCombSiteId = 0;  // comb site ID for guard-removal injection (0 = disabled)
   int faultCombOperand = 0; // operand index to replace with identity (guard-removal only)
   // Runtime-switchable faults (NEXT_STEPS #6, coord/contracts/switchable_fault.md):
-  // instead of baking ONE fault, make EVERY trace.comb_site_id-tagged gate
-  // operand switchable at runtime. Each (site, operand) gets an i8 model state
-  // `__fault_en_<site>_<operand>` (a fault-CLASS byte: 0 = off, 1 = guard
-  // removal; further classes reserved for NEXT_STEPS #6b) and the operand is
-  // rewritten to `mux(class == 1, identity, operand)`. Mutually exclusive with
-  // the baked modes above.
+  // instead of baking ONE fault, make EVERY instrumentable site switchable at
+  // runtime via a per-site i8 enable state. Classes: guard-removal (`__fault_en_<site>_<operand>`,
+  // class byte 1) and forced mux-select (`__fault_en_mux_<site>`, classes 3/4) are
+  // always instrumented. Mutually exclusive with the baked faultCombSiteId mode.
   bool faultSwitchable = false;
+  // Eval-B #3 ablation: ALSO instrument every arc.state_write with a switchable naive
+  // bit-flip (`__fault_en_bf_<site>`, the i8 value encodes the bit: 0=off, v=>bit v-1).
+  // Built into a SEPARATE binary so the default switchable binary stays byte-identical
+  // and cost-unchanged. Requires faultSwitchable. The naive strawman primitive
+  // (DESIGN.md) — a loud opt-in, never on by default.
+  bool faultSwitchableBitflip = false;
 };
 
 /// Create an InjectFaultPass instance.
-/// Exactly one of faultWriteSiteId or faultCombSiteId must be nonzero.
-/// If both are zero the pass runs in "marked" mode (see below) and is a no-op
+/// With faultCombSiteId > 0 the pass bakes one guard-removal fault; with
+/// faultSwitchable it makes every site runtime-switchable instead.
+/// If neither is set the pass runs in "marked" mode (see below) and is a no-op
 /// unless the module carries `trace.fault_target` attributes.
 std::unique_ptr<mlir::Pass>
 createInjectFaultPass(InjectFaultPassOptions opts = {});

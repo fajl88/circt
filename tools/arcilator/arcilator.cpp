@@ -155,18 +155,6 @@ static llvm::cl::opt<std::string>
                       llvm::cl::init(""), llvm::cl::cat(mainCategory));
 
 static llvm::cl::opt<int>
-    faultWriteSiteId("fault-write-site-id",
-                     llvm::cl::desc("Signal ID (write_site_id) at which to "
-                                    "inject a bit-flip fault (0 = disabled)"),
-                     llvm::cl::init(0), llvm::cl::cat(mainCategory));
-
-static llvm::cl::opt<int>
-    faultBit("fault-bit",
-             llvm::cl::desc("Bit position to flip when --fault-write-site-id "
-                            "is set (0-indexed from LSB)"),
-             llvm::cl::init(0), llvm::cl::cat(mainCategory));
-
-static llvm::cl::opt<int>
     faultCombSiteId("fault-comb-site-id",
                     llvm::cl::desc("Comb site ID (comb_site_id) at which to "
                                    "inject a guard-removal fault (0 = disabled)"),
@@ -181,10 +169,18 @@ static llvm::cl::opt<int>
 static llvm::cl::opt<bool> faultSwitchable(
     "fault-switchable",
     llvm::cl::desc(
-        "Make every trace.comb_site_id-tagged gate operand runtime-switchable "
-        "via __fault_en_<site>_<operand> i8 model states (compile once, "
-        "select faults per run; mutually exclusive with --fault-comb-site-id/"
-        "--fault-write-site-id)"),
+        "Make every trace.comb_site_id-tagged gate operand and source mux "
+        "runtime-switchable via __fault_en_* i8 model states (compile once, "
+        "select faults per run; mutually exclusive with --fault-comb-site-id)"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<bool> faultSwitchableBitflip(
+    "fault-switchable-bitflip",
+    llvm::cl::desc(
+        "In addition to --fault-switchable, make every arc.state_write a "
+        "runtime-switchable naive bit-flip via __fault_en_bf_<site> i8 states "
+        "(Eval-B #3 ablation). Builds a SEPARATE binary so the default "
+        "switchable binary stays byte-identical. Requires --fault-switchable."),
     llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
 static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
@@ -450,10 +446,13 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // the state write receives the flipped value. The switchable mode runs in
   // the same slot (before state allocation, so its __fault_en states get
   // storage and model_state.json entries).
-  if (faultWriteSiteId > 0 || faultCombSiteId > 0 || faultSwitchable)
-    pm.addPass(arc::createInjectFaultPass({faultWriteSiteId, faultBit,
-                                           faultCombSiteId, faultCombOperand,
-                                           faultSwitchable}));
+  if (faultSwitchableBitflip && !faultSwitchable)
+    llvm::report_fatal_error(
+        "--fault-switchable-bitflip requires --fault-switchable (no silent no-op)");
+  if (faultCombSiteId > 0 || faultSwitchable)
+    pm.addPass(arc::createInjectFaultPass({faultCombSiteId, faultCombOperand,
+                                           faultSwitchable,
+                                           faultSwitchableBitflip}));
 
   // Allocate states.
   if (untilReached(UntilStateAlloc))

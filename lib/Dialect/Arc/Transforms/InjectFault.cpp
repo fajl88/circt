@@ -1,26 +1,25 @@
 //===- InjectFault.cpp - Inject a fault at a write or comb site -----------===//
 //
 // Runs at the END of populateArcStateLoweringPipeline, immediately after
-// EmitCausality.  Supports two mutually exclusive fault modes:
+// EmitCausality.  Two modes:
 //
-// 1. Bit-flip (faultWriteSiteId > 0):
-//    Locates the arc.state_write op at position faultWriteSiteId (same walk
-//    order as EmitCausality::enumWriteSites()), then inserts:
-//      %mask    = arith.constant (1 << fault_bit) : iN
-//      %flipped = comb.xor %original_val, %mask   : iN
-//    before the write, replacing the written value with %flipped.
+// 1. Baked guard-removal (faultCombSiteId > 0, or the marked trace.fault_target
+//    path): Locates the comb.and / comb.or op at position faultCombSiteId (same
+//    walk order as EmitCausality::enumCombSites()), then replaces operand
+//    faultCombOperand with the gate's identity constant (AND: all-ones, OR: zero).
+//    This permanently removes the operand's influence, modelling a forgotten-guard
+//    structural bug.  This baked path feeds the firtool/Verilog miter export.
 //
-// 2. Guard-removal (faultCombSiteId > 0):
-//    Locates the comb.and / comb.or op at position faultCombSiteId (same walk
-//    order as EmitCausality::enumCombSites()), then replaces operand
-//    faultCombOperand with the gate's identity constant:
-//      AND: all-ones  (identity for AND)
-//      OR:  zero      (identity for OR)
-//    This permanently removes the operand from the gate's influence, modelling
-//    a forgotten-guard structural bug.
+// 2. Runtime-switchable (faultSwitchable): instead of baking ONE fault, make every
+//    instrumentable site switchable at runtime via a per-site i8 enable state
+//    (coord/contracts/switchable_fault.md).  Classes: guard-removal (class 1) and
+//    forced mux-select (classes 3/4) are always instrumented; NAIVE BIT-FLIP is
+//    instrumented ONLY when faultSwitchableBitflip is also set (a SEPARATE
+//    ablation-only binary, so the default switchable binary stays byte-identical and
+//    cost-unchanged — Eval-B #3, the naive strawman primitive, DESIGN.md).
 //
-// Fails loudly (signalPassFailure + emitError) if both IDs are nonzero,
-// if the requested site is not found, or if the operand is out of range.
+// Fails loudly (signalPassFailure + emitError) on a missing site / out-of-range
+// operand / a site outside any arc.model.
 //
 //===----------------------------------------------------------------------===//
 
@@ -83,21 +82,22 @@ circt::arc::createInjectFaultPass(InjectFaultPassOptions opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: enumerate arc.state_write ops in the same deterministic walk order
-// used by EmitCausality::enumWriteSites().  Must stay in sync.
+// Helper: bring an integer Value to `toWidth` bits — truncate (comb.extract low
+// bits) or zero-extend (comb.concat zeros above).  Used by the switchable bit-flip
+// class to widen an i8 bit-index to the written value's width, since comb shift
+// operands must share width.
 // ---------------------------------------------------------------------------
 
-static StateWriteOp findWriteOpById(ModuleOp module, int64_t targetId) {
-  int64_t counter = 1;
-  StateWriteOp found;
-  module.walk([&](StateWriteOp op) {
-    if (found)
-      return;
-    if (counter == targetId)
-      found = op;
-    counter++;
-  });
-  return found;
+static Value adjustWidth(OpBuilder &b, Location loc, Value v, unsigned toWidth) {
+  unsigned fromWidth = cast<IntegerType>(v.getType()).getWidth();
+  if (fromWidth == toWidth)
+    return v;
+  if (fromWidth > toWidth)
+    return comb::ExtractOp::create(b, loc, b.getIntegerType(toWidth), v,
+                                   /*lowBit=*/0);
+  Value zeros = hw::ConstantOp::create(b, loc, APInt(toWidth - fromWidth, 0));
+  return comb::ConcatOp::create(b, loc, b.getIntegerType(toWidth),
+                                ValueRange{zeros, v});
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +238,7 @@ static LogicalResult faultMuxOp(Operation *targetOp, int forcedBit,
 // bytes are compared exactly (==1, ==3, ==4) so the classes never alias.
 // ---------------------------------------------------------------------------
 
-static LogicalResult runSwitchable(ModuleOp module) {
+static LogicalResult runSwitchable(ModuleOp module, bool doBitflip) {
   // Switchable sites must live inside an arc.model body — that is where the
   // storage block argument for the enable states lives. A site outside any model
   // could not be switched and would silently diverge from the baked mode, a hard
@@ -412,12 +412,93 @@ static LogicalResult runSwitchable(ModuleOp module) {
     }
   }
 
+  // Naive bit-flip (Eval-B #3 ablation baseline) — ONLY in the separate bit-flip binary
+  // (doBitflip), so the default switchable binary stays byte-identical. Make every
+  // arc.state_write's written value runtime-switchable: site N = its position in the
+  // enumWriteSites walk (the same 1-indexed module.walk order EmitCausality stamps as
+  // write_site_id, so --fault-bf-site-id N targets the trace's write_site_id N). Per site
+  // an i8 __fault_en_bf_<N>: value 0 => no flip (identity, byte-identical to ref); value
+  // v in [1,255] => flip bit (v-1) of the written value. Bit-flip is the NAIVE strawman
+  // primitive (DESIGN.md "The problem with bit-flip injection") — a loud opt-in, never
+  // injected by default.
+  int64_t bfStates = 0, bfWrapped = 0, bfSkippedNonInt = 0, bfSkippedWide = 0;
+  if (doBitflip) {
+    int64_t bfCounter = 0;
+    bool bfFailed = false;
+    module.walk([&](StateWriteOp writeOp) {
+      int64_t siteId = ++bfCounter; // 1-indexed; matches enumWriteSites/write_site_id
+      Value writtenVal = writeOp.getValue();
+      auto itype = dyn_cast<IntegerType>(writtenVal.getType());
+      if (!itype) {
+        ++bfSkippedNonInt; // non-integer write: no enable state (driver fails loud if targeted)
+        return;
+      }
+      unsigned width = itype.getWidth();
+      // i8 enable encodes bits 0..254; a state wider than 255 bits cannot address its
+      // high bits, so SKIP it (and count) rather than silently truncating the bit index.
+      // Architectural regs are <=64b; only wide memory-cell writes hit this.
+      if (width > 255) {
+        ++bfSkippedWide;
+        return;
+      }
+      auto model = writeOp->getParentOfType<ModelOp>();
+      if (!model) {
+        writeOp->emitError("InjectFault(switchable): state_write site ")
+            << siteId << " is not inside an arc.model — cannot allocate its bit-flip "
+                         "enable state";
+        bfFailed = true;
+        return;
+      }
+      Block &body = model.getBodyBlock();
+      if (body.getNumArguments() < 1) {
+        model.emitError("InjectFault(switchable): arc.model body has no storage block "
+                        "argument");
+        bfFailed = true;
+        return;
+      }
+      Value storage = body.getArgument(0);
+      OpBuilder allocBuilder(model.getContext());
+      allocBuilder.setInsertionPointToStart(&body);
+      auto i8Ty = allocBuilder.getIntegerType(8);
+      auto alloc = AllocStateOp::create(allocBuilder, model.getLoc(),
+                                        StateType::get(i8Ty), storage);
+      alloc->setAttr("name", allocBuilder.getStringAttr("__fault_en_bf_" +
+                                                        std::to_string(siteId)));
+      ++bfStates;
+
+      OpBuilder b(writeOp);
+      Location loc = writeOp.getLoc();
+      Value en = StateReadOp::create(b, loc, alloc); // i8
+      Value zero8 = hw::ConstantOp::create(b, loc, APInt(8, 0));
+      Value one8 = hw::ConstantOp::create(b, loc, APInt(8, 1));
+      Value bitIdx8 = comb::SubOp::create(b, loc, en, one8); // en-1 (meaningful when en!=0)
+      // Compute the shift in the VALUE's width, not i8, so it doesn't overflow for
+      // wide-but-<=255 states (e.g. i40).
+      Value shamt = adjustWidth(b, loc, bitIdx8, width);
+      Value oneN = hw::ConstantOp::create(b, loc, APInt(width, 1));
+      Value mask = comb::ShlOp::create(b, loc, oneN, shamt, /*twoState=*/true);
+      Value flipped = comb::XorOp::create(b, loc, writtenVal, mask, /*twoState=*/true);
+      Value enabled =
+          comb::ICmpOp::create(b, loc, comb::ICmpPredicate::ne, en, zero8);
+      Value result = comb::MuxOp::create(b, loc, enabled, flipped, writtenVal);
+      writeOp.getValueMutable().assign(result);
+      ++bfWrapped;
+    });
+    if (bfFailed)
+      return failure();
+  }
+
   llvm::errs() << "[inject-fault] switchable: " << taggedTotal
                << " tagged gate clones, " << numEnableStates
                << " __fault_en_<site>_<operand> states, " << numMuxedOperands
                << " operands muxed; " << taggedMuxTotal << " source-mux clones, "
                << numMuxEnableStates << " __fault_en_mux_<site> states, "
-               << numGatedMuxes << " mux selects gated\n";
+               << numGatedMuxes << " mux selects gated";
+  if (doBitflip)
+    llvm::errs() << "; bit-flip: " << bfWrapped << " state_writes wrapped, " << bfStates
+                 << " __fault_en_bf_<site> states (" << bfSkippedNonInt
+                 << " non-int + " << bfSkippedWide << " >255b skipped)";
+  llvm::errs() << "\n";
   return success();
 }
 
@@ -426,69 +507,17 @@ static LogicalResult runSwitchable(ModuleOp module) {
 // ---------------------------------------------------------------------------
 
 void InjectFaultPass::runOnOperation() {
-  const bool doBitFlip = opts.faultWriteSiteId > 0;
-
   ModuleOp module = getOperation();
 
-  if (doBitFlip && opts.faultCombSiteId > 0) {
-    module.emitError("InjectFault: faultWriteSiteId and faultCombSiteId are "
-                     "mutually exclusive — set exactly one");
-    signalPassFailure();
-    return;
-  }
-
   if (opts.faultSwitchable) {
-    if (doBitFlip || opts.faultCombSiteId > 0) {
+    if (opts.faultCombSiteId > 0) {
       module.emitError("InjectFault: faultSwitchable is mutually exclusive "
-                       "with the baked faultWriteSiteId/faultCombSiteId modes");
+                       "with the baked faultCombSiteId mode");
       signalPassFailure();
       return;
     }
-    if (failed(runSwitchable(module)))
+    if (failed(runSwitchable(module, opts.faultSwitchableBitflip)))
       signalPassFailure();
-    return;
-  }
-
-  if (doBitFlip) {
-    // ------------------------------------------------------------------
-    // Bit-flip: XOR one bit of the written value before the write.
-    // ------------------------------------------------------------------
-    StateWriteOp writeOp = findWriteOpById(module, opts.faultWriteSiteId);
-    if (!writeOp) {
-      module.emitError("InjectFault: no write site found with write_site_id=")
-          << opts.faultWriteSiteId
-          << " (max valid ID = number of arc.state_write ops in the module)";
-      signalPassFailure();
-      return;
-    }
-
-    Value writtenVal = writeOp.getValue();
-    auto itype = dyn_cast<IntegerType>(writtenVal.getType());
-    if (!itype) {
-      module.emitError("InjectFault: write_site_id=")
-          << opts.faultWriteSiteId
-          << " written value is not an IntegerType — cannot inject bit_flip";
-      signalPassFailure();
-      return;
-    }
-
-    unsigned width = itype.getWidth();
-    if (opts.faultBit < 0 || (unsigned)opts.faultBit >= width) {
-      module.emitError("InjectFault: fault_bit=")
-          << opts.faultBit << " is out of range for " << width << "-bit signal";
-      signalPassFailure();
-      return;
-    }
-
-    OpBuilder b(writeOp);
-    Location loc = writeOp.getLoc();
-    APInt maskVal(width, 1);
-    maskVal <<= opts.faultBit;
-    Value mask = arith::ConstantOp::create(b, loc,
-                                            b.getIntegerAttr(itype, maskVal));
-    Value flipped = comb::XorOp::create(b, loc, writtenVal, mask,
-                                         /*twoState=*/true);
-    writeOp.getValueMutable().assign(flipped);
     return;
   }
 
