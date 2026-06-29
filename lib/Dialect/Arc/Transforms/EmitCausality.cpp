@@ -201,7 +201,7 @@ private:
 
   // External function declarations added to the module
   func::FuncOp beginDecl, addPredDecl, commitDecl, addCombPredDecl,
-      addMuxDecisionDecl;
+      addMuxDecisionDecl, recorderOnceDecl;
 
   // -----------------------------------------------------------------------
   // Memoized recorder functions.
@@ -224,6 +224,15 @@ private:
   };
   DenseMap<Value, RecorderInfo> recorderCache;
   unsigned recorderCounter = 0;
+
+  // Runtime-invocation memoization. Each recorder gets a stable integer id
+  // (assigned lazily at its first emitRecorderCall). At runtime, a per-event
+  // guard (causality_recorder_once) lets each recorder body run AT MOST ONCE
+  // per commit — so a reconvergent sub-cone shared by many callers executes
+  // once (O(nodes)) instead of once-per-path (O(paths)). Byte-identical output
+  // (a value's predecessor contribution is path-independent).
+  DenseMap<Operation *, int64_t> recIdMap;
+  int64_t recIdCounter = 0;
 
   // Emit or retrieve the memoized recorder for a given SSA value.
   RecorderInfo getOrEmitRecorder(Value val);
@@ -300,6 +309,8 @@ void EmitCausalityPass::runOnOperation() {
   // Reset memoization state (pass instance may be reused across modules).
   recorderCache.clear();
   recorderCounter = 0;
+  recIdMap.clear();
+  recIdCounter = 0;
 
   enumSignals();
   enumMemories(); // #12: must follow enumSignals (allocates above reg watermark)
@@ -721,6 +732,10 @@ void EmitCausalityPass::declareRuntimeFuncs() {
                                   FunctionType::get(ctx, {i64, i64, i8}, {}));
   addMuxDecisionDecl = getOrDeclare("causality_add_mux_decision",
                                      FunctionType::get(ctx, {i64, i8, i8}, {}));
+  // Runtime-invocation memoization guard: (recorder_id) -> 1 if first time this
+  // event, 0 if already run. i32 result (unambiguous ABI vs C int32_t).
+  recorderOnceDecl = getOrDeclare("causality_recorder_once",
+                                   FunctionType::get(ctx, {i64}, {i32}));
 }
 
 // =======================================================================
@@ -1192,6 +1207,31 @@ EmitCausalityPass::getOrEmitRecorder(Value val) {
 void EmitCausalityPass::emitRecorderCall(OpBuilder &b, Location loc,
                                           const RecorderInfo &info,
                                           const DenseMap<Value, Value> &argMap) {
+  // Runtime-invocation memoization: guard the call so the recorder body runs at
+  // most ONCE per event. A reconvergent sub-cone is shared by many callers;
+  // without this, the body (and its whole sub-tree) re-executes once per PATH
+  // through the DAG — O(paths), catastrophic on wide cores (BOOM medium/large).
+  // The guard collapses runtime cost to O(nodes). Output is byte-identical: the
+  // predecessor contribution of a value is path-independent (see header), so
+  // running once vs N-times-deduped yields the same trace.
+  Operation *fop = info.funcOp.getOperation();
+  auto it = recIdMap.find(fop);
+  int64_t recId;
+  if (it == recIdMap.end()) {
+    recId = recIdCounter++;
+    recIdMap[fop] = recId;
+  } else {
+    recId = it->second;
+  }
+  Value once =
+      b.create<func::CallOp>(loc, recorderOnceDecl, ValueRange{cI64(b, loc, recId)})
+          .getResult(0);
+  Value first =
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, once, cI32(b, loc, 0));
+  auto ifOp = b.create<scf::IfOp>(loc, first, /*withElseRegion=*/false);
+  OpBuilder::InsertionGuard g(b);
+  b.setInsertionPoint(ifOp.thenBlock()->getTerminator());
+
   if (info.liveIns.empty()) {
     b.create<func::CallOp>(loc, info.funcOp, ValueRange{});
     return;
@@ -1199,10 +1239,10 @@ void EmitCausalityPass::emitRecorderCall(OpBuilder &b, Location loc,
   SmallVector<Value> callArgs;
   callArgs.reserve(info.liveIns.size());
   for (auto modelVal : info.liveIns) {
-    auto it = argMap.find(modelVal);
-    assert(it != argMap.end() &&
+    auto ait = argMap.find(modelVal);
+    assert(ait != argMap.end() &&
            "recorder live-in not found in caller argMap");
-    callArgs.push_back(it->second);
+    callArgs.push_back(ait->second);
   }
   b.create<func::CallOp>(loc, info.funcOp, callArgs);
 }
