@@ -1214,7 +1214,8 @@ void EmitCausalityPass::emitRecorderCall(OpBuilder &b, Location loc,
   // The guard collapses runtime cost to O(nodes). Output is byte-identical: the
   // predecessor contribution of a value is path-independent (see header), so
   // running once vs N-times-deduped yields the same trace.
-  Operation *fop = info.funcOp.getOperation();
+  func::FuncOp recFn = info.funcOp; // copy the lightweight handle (info is const)
+  Operation *fop = recFn.getOperation();
   auto it = recIdMap.find(fop);
   int64_t recId;
   if (it == recIdMap.end()) {
