@@ -306,6 +306,17 @@ void EmitCausalityPass::runOnOperation() {
   if (opts.causalityDir.empty())
     return;
 
+  // Mandatory mode (no silent default): a causalityDir was requested but no
+  // injection/detection mode was set. Fail loudly rather than pick a profile —
+  // the wrong choice is a ~100x, hard-to-diagnose perf regression.
+  if (opts.mode == CausalityMode::Unset) {
+    module.emitError(
+        "EmitCausality: causality requested (causalityDir set) but mode is Unset "
+        "— arcilator --causality-mode=injection|detection is mandatory");
+    signalPassFailure();
+    return;
+  }
+
   // Reset memoization state (pass instance may be reused across modules).
   recorderCache.clear();
   recorderCounter = 0;
@@ -760,11 +771,14 @@ void EmitCausalityPass::injectForWrite(OpBuilder &builder, StateWriteOp writeOp,
 
   emitBegin(builder, loc, sinkId, wsid, writtenVal, numBits);
 
-  // Get or build the shared recorder for writtenVal, then call it.
-  // The recorder's liveIns are model SSA values directly available here.
-  RecorderInfo info = getOrEmitRecorder(writtenVal);
-  builder.create<func::CallOp>(loc, info.funcOp,
-                                ValueRange(info.liveIns));
+  // Detection mode records the written VALUE only (begin/commit) and skips the
+  // predecessor cone — the ~100x cost the fuzzer detection path never reads.
+  // Injection mode builds+calls the shared cone recorder so the trace slices.
+  if (opts.mode == CausalityMode::Injection) {
+    // The recorder's liveIns are model SSA values directly available here.
+    RecorderInfo info = getOrEmitRecorder(writtenVal);
+    builder.create<func::CallOp>(loc, info.funcOp, ValueRange(info.liveIns));
+  }
 
   emitCommit(builder, loc);
 }
@@ -784,8 +798,11 @@ void EmitCausalityPass::injectForMemWrite(OpBuilder &builder,
 
   Value sinkVal = cellId(builder, loc, mi.base, addr);
   emitBeginDynamic(builder, loc, sinkVal, wsid, data, numBits);
-  RecorderInfo info = getOrEmitRecorder(data);
-  builder.create<func::CallOp>(loc, info.funcOp, ValueRange(info.liveIns));
+  // Detection mode: value-only (no cone), same as injectForWrite.
+  if (opts.mode == CausalityMode::Injection) {
+    RecorderInfo info = getOrEmitRecorder(data);
+    builder.create<func::CallOp>(loc, info.funcOp, ValueRange(info.liveIns));
+  }
   emitCommit(builder, loc);
 }
 

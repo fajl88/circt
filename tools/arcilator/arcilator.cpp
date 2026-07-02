@@ -154,6 +154,15 @@ static llvm::cl::opt<std::string>
                                      "instrument as first-class causality cells"),
                       llvm::cl::init(""), llvm::cl::cat(mainCategory));
 
+// MANDATORY whenever --causality-dir is set (no default; see EmitCausalityPass.h
+// CausalityMode). 'injection' = full predecessor cones (sliceable). 'detection' =
+// value-only records, no cones (~100x faster; fuzzer vs-Spike detection only).
+static llvm::cl::opt<std::string>
+    causalityMode("causality-mode",
+                  llvm::cl::desc("Causality instrumentation mode (REQUIRED with "
+                                 "--causality-dir): 'injection' | 'detection'"),
+                  llvm::cl::init(""), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<int>
     faultCombSiteId("fault-comb-site-id",
                     llvm::cl::desc("Comb site ID (comb_site_id) at which to "
@@ -436,10 +445,27 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
 
   // Inject causality instrumentation immediately after state lowering so that
   // arc.state_write and comb.mux are still in the same flat scope.
-  if (!causalityDir.empty())
+  if (!causalityDir.empty()) {
+    // Mandatory mode — no silent default (a forgotten flag would be a ~100x
+    // detection perf regression), so refuse to build without an explicit choice.
+    arc::CausalityMode mode;
+    if (causalityMode == "injection")
+      mode = arc::CausalityMode::Injection;
+    else if (causalityMode == "detection")
+      mode = arc::CausalityMode::Detection;
+    else {
+      std::string msg =
+          std::string("--causality-mode is REQUIRED with --causality-dir and must "
+                      "be 'injection' (full cones, sliceable) or 'detection' "
+                      "(value-only, no cones, fast); got '") +
+          std::string(causalityMode) +
+          "' -- refusing to build with an unspecified mode";
+      llvm::report_fatal_error(msg.c_str());
+    }
     pm.addPass(arc::createEmitCausalityPass(
         {std::string(causalityDir), std::string(causalitySinks),
-         std::string(causalityMemories)}));
+         std::string(causalityMemories), mode}));
+  }
 
   // Inject fault immediately after causality instrumentation so that
   // EmitCausality records the original (pre-fault) data flow, while
