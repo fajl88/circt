@@ -331,9 +331,33 @@ void EmitCausalityPass::runOnOperation() {
   writeSignalIndex();
   declareRuntimeFuncs();
 
-  // Instrument ALL write sites, not just named sinks.
-  // Every write site must emit a causality event so that backward slicing
-  // can follow predecessors transitively through the full circuit.
+  // Which write sites to instrument:
+  //  Injection: ALL write sites — backward slicing must follow predecessors
+  //    transitively through the full circuit, so every state write emits an event.
+  //  Detection: ONLY the observable sinks (--causality-sinks). The fuzzer detection
+  //    path reads exactly those sink_ids (vs Spike); non-sink write events are never
+  //    read, so instrumenting them is pure waste. We match names EXACTLY as the oracle
+  //    resolves observables (tools/campaign/observables.py: `name in name_to_id`, where
+  //    name_to_id is __signal_index.json = getStateName) — identical set by construction,
+  //    so no observable is dropped and none is spuriously added.
+  llvm::StringSet<> detectionSinks;
+  if (opts.mode == CausalityMode::Detection) {
+    for (StringRef s(opts.sinkNames); !s.empty();) {
+      auto [tok, rest] = s.split(',');
+      tok = tok.trim();
+      if (!tok.empty())
+        detectionSinks.insert(tok);
+      s = rest;
+    }
+    if (detectionSinks.empty()) {
+      module.emitError("EmitCausality detection mode: --causality-sinks is empty — "
+                       "no observables to instrument (the detection trace would be "
+                       "empty; no silent fallback)");
+      signalPassFailure();
+      return;
+    }
+  }
+
   SmallVector<StateWriteOp> writes;
   module.walk([&](StateWriteOp op) { writes.push_back(op); });
 
@@ -341,11 +365,24 @@ void EmitCausalityPass::runOnOperation() {
     int64_t sinkId = lookupId(writeOp.getState());
     if (sinkId == -1)
       continue;
+    if (opts.mode == CausalityMode::Detection &&
+        !detectionSinks.contains(getStateName(writeOp.getState())))
+      continue; // detection: skip non-observable writes (never read by the oracle)
     OpBuilder builder(writeOp);
     injectForWrite(builder, writeOp, sinkId);
   }
 
   // NEXT_STEPS #12: instrument in-scope memory writes as cell write events.
+  // Detection mode with memory observables is not supported (it would instrument all
+  // cells, not just observables). Fail loudly rather than silently skip/over-record —
+  // no current detection config uses causality_memories, so this never fires today.
+  if (opts.mode == CausalityMode::Detection && !memToInfo.empty()) {
+    module.emitError("EmitCausality detection mode does not support memory "
+                     "observables (--causality-memories) yet — use injection mode "
+                     "or extend detection to filter observable cells");
+    signalPassFailure();
+    return;
+  }
   if (!memToInfo.empty()) {
     SmallVector<MemoryWriteOp> memWrites;
     module.walk([&](MemoryWriteOp op) { memWrites.push_back(op); });
