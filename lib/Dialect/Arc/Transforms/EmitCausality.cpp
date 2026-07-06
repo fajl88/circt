@@ -373,16 +373,14 @@ void EmitCausalityPass::runOnOperation() {
   }
 
   // NEXT_STEPS #12: instrument in-scope memory writes as cell write events.
-  // Detection mode with memory observables is not supported (it would instrument all
-  // cells, not just observables). Fail loudly rather than silently skip/over-record —
-  // no current detection config uses causality_memories, so this never fires today.
-  if (opts.mode == CausalityMode::Detection && !memToInfo.empty()) {
-    module.emitError("EmitCausality detection mode does not support memory "
-                     "observables (--causality-memories) yet — use injection mode "
-                     "or extend detection to filter observable cells");
-    signalPassFailure();
-    return;
-  }
+  // Detection mode included (2026-07-06, unblocks the BOOM fast trial sim):
+  // --causality-memories is by definition the OBSERVED-memory list (BOOM: the
+  // architectural integer register file, whose cells the vs-Spike oracle reads via
+  // the __signal_index.json `memories` block), so instrumenting exactly memToInfo
+  // records exactly the observable cells. injectForMemWrite is already mode-aware —
+  // in detection it emits the value-only begin/commit and skips the predecessor-cone
+  // recorder, same as injectForWrite. The signal index is written identically in
+  // both modes (before this point), so the detect build's byte-identity gate holds.
   if (!memToInfo.empty()) {
     SmallVector<MemoryWriteOp> memWrites;
     module.walk([&](MemoryWriteOp op) { memWrites.push_back(op); });
